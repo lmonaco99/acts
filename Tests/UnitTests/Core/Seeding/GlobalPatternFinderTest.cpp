@@ -31,6 +31,7 @@
 #include <memory>
 #include <numbers>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -171,146 +172,8 @@ class TestSector {
 static_assert(SectorType<TestSector>);
 
 ///////////////////////////////////////////////////////////////////////////////
-/// Mocked GPF ingredients - global pattern finder hit, topology, seed selector
-/// and phi-only hit provider
+/// Muon & track generator
 ///////////////////////////////////////////////////////////////////////////////
-/// @brief GPF hit. It wraps a space point created in the local chamber frame by
-///         the MeasurementGenerator and caches its global representation.
-struct TestHit {
-  const FitTestSpacePoint* sp{nullptr};
-  /// @brief Global position
-  Vector3 position{Vector3::Zero()};
-  /// @brief Global sensor direction (strip in the bending direction for
-  ///         combined strip space points)
-  Vector3 sensorDir{Vector3::UnitX()};
-  /// @brief Global measured directions of the strip: the first is orthogonal
-  ///  to the sensor direction, the second is the measured direction of the
-  ///  complementary strip, only for non-orthogonal combined strips
-  StripMeasurementDirections measDirs{Vector3::UnitY(), std::nullopt};
-  /// @brief Station of the hit
-  Station station{Station::BI};
-  /// @brief Sector of the hit
-  TestSector::Index_t sector{0u};
-  /// @brief Distance of the measurement layer plane from the beam axis
-  ///         (barrel) or from the transverse plane through the origin (endcap)
-  double layerDistance{0.};
-  /// @brief Index of the generating muon (-1 for background)
-  int muonIdx{-1};
-
-  const FitTestSpacePoint& spacePoint() const { return *sp; }
-  const Vector3& globalPosition(const GeometryContext& /*gctx*/) const {
-    return position;
-  }
-  const Vector3& globalSensorDirection(const GeometryContext& /*gctx*/) const {
-    return sensorDir;
-  }
-  StripMeasurementDirections stripMeasurementDirections(
-      const GeometryContext& /*gctx*/) const {
-    return measDirs;
-  }
-  bool isPrecision() const { return sp->isStraw(); }
-  bool overlaps(const TestHit& other) const { return sp == other.sp; }
-};
-static_assert(GlobPatFinderHit<TestHit>);
-
-/// @brief Pattern topology: one group per station. The stations are ordered
-///         Inner -> Middle -> Outer and, inside a station, the layers by their
-///         distance from the interaction point.
-struct TestTopology {
-  static constexpr std::uint8_t nGroups{s_nStations};
-  /// @brief Compare two hits by measurement layer.
-  static std::weak_ordering compareLayers(const TestHit& hit1,
-                                          const TestHit& hit2) {
-    if (hit1.station != hit2.station) {
-      if (toStationLayer(hit1.station) != toStationLayer(hit2.station)) {
-        return toStationLayer(hit1.station) <=> toStationLayer(hit2.station);
-      }
-      return toUnderlying(hit1.station) <=> toUnderlying(hit2.station);
-    }
-    if (std::abs(hit1.layerDistance - hit2.layerDistance) < s_epsilon) {
-      return std::weak_ordering::equivalent;
-    }
-    return hit1.layerDistance < hit2.layerDistance
-               ? std::weak_ordering::less
-               : std::weak_ordering::greater;
-  }
-  /// @brief Return the group index of a hit.
-  static std::uint8_t groupIndex(const TestHit& hit) {
-    return toUnderlying(hit.station);
-  }
-};
-static_assert(PatternTopology<TestTopology, TestHit>);
-
-using GlobalPatternFinder_t =
-    GlobalPatternFinder<TestHit, TestSector, TestTopology>;
-using SearchTree_t = GlobalPatternFinder_t::SearchTree_t;
-using HitCoords = GlobalPatternFinder_t::HitCoords;
-
-/// @brief Seed selector: seeds from middle & outer strip hits. A single,
-///         large theta window is used for all the station pairs, since the
-///         test probes the pattern building and not the CPU performance.
-class TestSeedSelector {
- public:
-  /// @brief Default constructor
-  explicit TestSeedSelector(const double thetaWindow)
-      : m_thetaWindow{thetaWindow} {};
-  /// @brief Whether the hit is good for seeding a pattern: strip hits of the
-  ///        Middle and Outer stations
-  bool goodForSeeding(const TestHit& hit) const {
-    return !hit.sp->isStraw() &&
-           toStationLayer(hit.station) != StationLayer::Inner;
-  }
-  /// @brief Return the theta search window(s) for a given hit.
-  std::array<double, TestTopology::nGroups> thetaSearchWindow(
-      const TestHit& /*hit*/) const {
-    return filledArray<double, TestTopology::nGroups>(m_thetaWindow);
-  }
-
- private:
-  double m_thetaWindow{3._degree};
-};
-static_assert(PatternSeedSelector<TestSeedSelector, TestHit, TestTopology>);
-
-/// @brief Provides the phi-only hits from the chambers (station & sector)
-///         contributing eta hits to the pattern
-struct TestPhiProvider {
-  using PatternState_t = GlobalPatternFinder_t::PatternStateAux;
-  using PhiHitsPerGroup =
-      std::array<std::vector<TestHit>, TestTopology::nGroups>;
-
-  /// @brief Constructor from the phi-only hits of the event
-  explicit TestPhiProvider(std::vector<TestHit>&& phiHits)
-      : phiOnlyHits{std::move(phiHits)} {}
-
-  /// @brief Return the phi-only hits for each group in the pattern.
-  PhiHitsPerGroup getPhiOnlyHits(const PatternState_t& pattern,
-                                 const GeometryContext& /*gctx*/) const {
-    PhiHitsPerGroup result{};
-    for (const auto [group, hits] : enumerate(pattern.hitsPerGroup)) {
-      std::vector<TestSector::Index_t> sectors{};
-      for (const auto& hit : hits) {
-        if (std::ranges::find(sectors, hit->sector) == sectors.end()) {
-          sectors.push_back(hit->sector);
-        }
-      }
-      for (const TestHit& phiHit : phiOnlyHits) {
-        if (TestTopology::groupIndex(phiHit) == group &&
-            std::ranges::find(sectors, phiHit.sector) != sectors.end()) {
-          result[group].push_back(phiHit);
-        }
-      }
-    }
-    return result;
-  }
-  std::vector<TestHit> phiOnlyHits{};
-};
-static_assert(
-    OnlyPhiHitsProvider<TestPhiProvider, TestHit, TestTopology, TestSector>);
-
-///////////////////////////////////////////////////////////////////////////////
-/// Muon generator
-///////////////////////////////////////////////////////////////////////////////
-
 /// @brief Truth information of the generated muon.
 struct MuonTruth {
   Region region{Region::Barrel};
@@ -321,10 +184,6 @@ struct MuonTruth {
   /// @brief z of the production vertex, on the beam axis
   double z0{0.};
 };
-/// @brief Point and tangent of the muon trajectory at the centre plane of each
-///  station of its sector (nullopt if the station is not crossed)
-using StationCrossings =
-    std::array<std::optional<std::pair<Vector3, Vector3>>, s_nStations>;
 /// @brief Trajectory of a muon from its production vertex on the beam axis,
 ///         in the half plane at constant phi. The toroidal field is along phi,
 ///         so the muon bends in the (rho, z) plane and phi stays constant. The
@@ -372,8 +231,11 @@ class ToroidTrajectory {
       m_points.push_back(point);
     }
   }
-  /// @brief Point and tangent of the trajectory at the centre plane of each
-  ///  station of the muon sector (nullopt if the station is not crossed)
+  /// @brief Point and tangent of the muon trajectory at the centre plane of each
+  ///  station of its sector (nullopt if the station is not crossed)
+  using StationCrossings =
+      std::array<std::optional<std::pair<Vector3, Vector3>>, s_nStations>;
+  /// @brief Compute the crossings of the trajectry with the stations
   StationCrossings stationCrossings() const {
     StationCrossings crossings{};
     for (std::size_t st = 0; st < s_nStations; ++st) {
@@ -394,7 +256,6 @@ class ToroidTrajectory {
     }
     return crossings;
   }
-
  private:
   /// @brief Global position of a trajectory point
   Vector3 globalPosition(const Point& p) const {
@@ -417,23 +278,41 @@ class ToroidTrajectory {
     }
     return std::nullopt;
   }
-
+  /// @brief Phi of the muon trajectory
   double m_phi{0.};
+  /// @brief Cached radial direction along the bending plane
   const Vector3 m_radialDir{Acts::makeDirectionFromPhiTheta(m_phi, 90._degree)};
+  /// @brief Points of the muon trajectory, stepped in the bending plane
   std::vector<Point> m_points{};
 };
-/// @brief Configuration of the measurement generator
-using StrawGenCfg_t = ActsTests::MeasurementGenerator::Config;
-/// @brief Container of the space points
-using StrawContainer_t = std::vector<std::shared_ptr<FitTestSpacePoint>>;
+
+///////////////////////////////////////////////////////////////////////////////
+/// Hit generator
+///////////////////////////////////////////////////////////////////////////////
+/// @brief Bucket of space-points. We add sector and truth information for this test.
+struct TestBucket_t : public std::vector<std::shared_ptr<FitTestSpacePoint>> {
+  /// @brief Transform from local to global coordinates of the space points in this bucket
+  Transform3 localToGlobal{Transform3::Identity()};
+  /// @brief Index of the muon that generated the space points in this bucket.
+  ///        -1 if the bucket is background.
+  int muonIdx {-1};
+  /// @brief Index of the sector where the space points in this bucket are located.
+  std::uint8_t sectorIdx{0u};
+};
+static_assert(CompositeSpacePointContainer<TestBucket_t>);
+
+/// @brief Global pattern finder hit
+using Hit_t = GlobPatFinderHit<TestBucket_t>;
 /// @brief Generator of the muons and of their hits in the toy spectrometer.
 ///  It owns the random engine and the space points of the current event.
 class GlobalPatternFinderHitGen {
  public:
+  /// @brief Configuration of the measurement generator
+  using StrawGenCfg_t = ActsTests::MeasurementGenerator::Config;
   /// @brief Configuration of the hit generation in each chamber.
   struct Config : StrawGenCfg_t {
     /// @brief MDT + combined trigger strips (RPC/TGC like): 2 gas gaps below
-    ///  and above the tubes
+    ///  and above the tubes. Here the options relevant for this test:
     Config() {
       createStraws = true;
       twinStraw = false;
@@ -479,7 +358,7 @@ class GlobalPatternFinderHitGen {
                               Vector3::UnitY());
   }
   /// @brief Clear the space points of the previous event
-  void newEvent() { m_spacePoints.clear(); }
+  void newEvent() { m_buckets.clear(); }
   /// @brief Generate a muon with random energy, eta and phi. |eta| is uniform
   ///  over the barrel and the endcap ranges together, so the region of
   ///  the muon is sampled as well.
@@ -502,10 +381,11 @@ class GlobalPatternFinderHitGen {
   /// @brief Create the space points of the muon in the chambers of its sector.
   ///  In each station, the MeasurementGenerator is run on the tangent to
   ///  the trajectory at the station centre plane.
-  std::vector<TestHit> spawnHits(const MuonTruth& muon, const int muonIdx) {
+  std::vector<Hit_t> spawnHits(const MuonTruth& muon, const int muonIdx) {
     const TestSector sector{muon.phi};
+    using StationCrossings = ToroidTrajectory::StationCrossings;
     const StationCrossings crossings{ToroidTrajectory{muon}.stationCrossings()};
-    std::vector<TestHit> hits{};
+    std::vector<Hit_t> hits{};
     std::vector<std::size_t> crossedStations{};
     for (const auto [st, crossing] : enumerate(crossings)) {
       if (crossing) {
@@ -549,6 +429,38 @@ class GlobalPatternFinderHitGen {
     }
     return hits;
   }
+  /// @brief Define the local layer index for the test spacepoints
+std::uint8_t localLayerIdx(const FitTestSpacePoint& hit) const {
+  /// Distance of the hit from the chamber centre plane
+  const double layerDistance {hit.localPosition().z() - MeasurementGenerator::tubeLayersCentreZ()};
+  /// Whether the hit is above or below the chamber centre plane
+  const bool upperSide {layerDistance > 0.};
+  /// Thickness of each tube layer
+  constexpr double tubeLayerThickness{MeasurementGenerator::tubeRadius * std::numbers::sqrt3};
+  /// Distance of the outermost tube layer from the chamber centre plane
+  constexpr double lastTubeDist{MeasurementGenerator::tubeLayersCentreZ() - MeasurementGenerator::chamberDistance};
+  /// Distance of the innermost tube layer from the chamber centre plane
+  constexpr double firstTubeDist{lastTubeDist - (MeasurementGenerator::nLayersPerMl - 1) * tubeLayerThickness};
+  /// Distance of the first strip layer from the chamber centre plane
+  constexpr double firstStripDist{lastTubeDist + MeasurementGenerator::tubeStripDist};
+  /// Number of strip layers per side
+  const std::size_t nStripLayers = m_cfg.stripDirLoc1.size() + m_cfg.nPhiOnlyLayers;
+  /// Thickness of the strip layers
+  const double stripLayerThickness{MeasurementGenerator::stripLayDist};
+
+  if (hit.isStraw()) {
+    /// Tube layers counted outwards from the chamber centre (0 = innermost)
+    const auto nTubes = static_cast<std::size_t>(std::lround((std::abs(layerDistance) - firstTubeDist) / tubeLayerThickness));
+    /// Below the centre, outwards is along -z: mirror the count inside the multilayer
+    return nStripLayers + (upperSide ? MeasurementGenerator::nLayersPerMl + nTubes
+                                     : MeasurementGenerator::nLayersPerMl - 1 - nTubes);
+  }
+  /// Strip layers counted outwards from the tubes (0 = closest to the tubes)
+  const auto nStrips = static_cast<std::size_t>(std::lround((std::abs(layerDistance) - firstStripDist) / stripLayerThickness));
+  /// Above: after the lower strips and all the tube layers. Below: mirrored.
+  return upperSide ? nStripLayers + 2 * MeasurementGenerator::nLayersPerMl + nStrips
+                   : nStripLayers - 1 - nStrips;
+}
 
  private:
   /// @brief Random sign, -1 or +1 with equal probability
@@ -575,10 +487,13 @@ class GlobalPatternFinderHitGen {
   /// @brief Create the space points of a straight line crossing a station.
   void spawnInStation(const Vector3& globLinePos, const Vector3& globLineDir,
                       const Station station, const TestSector& sector,
-                      const int muonIdx, std::vector<TestHit>& outHits) {
+                      const int muonIdx, std::vector<Hit_t>& outHits) {
     const auto st{toUnderlying(station)};
-    const Transform3 localToGlobal{
-        chamberFrame(station, sector, copySign(1., globLinePos.z()))};
+    TestBucket_t& bucket = *m_buckets.emplace_back(std::make_unique<TestBucket_t>());
+    bucket.sectorIdx = sector.sector();
+    bucket.muonIdx = muonIdx;
+    bucket.localToGlobal = chamberFrame(station, sector, copySign(1., globLinePos.z()));
+    const Transform3& localToGlobal{bucket.localToGlobal};
     const Vector3 locLinePos{localToGlobal.inverse() * globLinePos};
     const Vector3 locLineDir{localToGlobal.linear().transpose() * globLineDir};
 
@@ -603,12 +518,8 @@ class GlobalPatternFinderHitGen {
     if (muonIdx < 0) {
       genCfg.stripDirLoc0.resize(genCfg.stripDirLoc1.size());
     }
-    StrawContainer_t spacePoints{
-        MeasurementGenerator::spawn(line, 0., m_engine, genCfg, logger())};
 
-    for (auto& sp : spacePoints) {
-      TestHit hit{};
-      hit.sp = sp.get();
+    for (auto& sp : MeasurementGenerator::spawn(line, 0., m_engine, genCfg, logger())) {
       /// Phi-only strips are created at the local y = 0: the strip covers the
       /// whole chamber along the bending direction, so place it at the chamber
       /// centre and store its half length. The chamber is on the side of the
@@ -626,53 +537,159 @@ class GlobalPatternFinderHitGen {
             sp->localPosition().z()});
         sp->setStripHalfLength(0.5 * (s_extMax[st] - s_extMin[st]));
       }
-      hit.position = localToGlobal * sp->localPosition();
       /// The generated chambers are unbounded: apply the station extension. For
       /// phi-only strips, the track position on the strip plane is checked.
       const Vector3 extPos{isPhiOnly ? Vector3{localToGlobal * locTrackPos}
-                                     : hit.position};
+                                     : localToGlobal * sp->localPosition()};
       const double ext{toRegion(station) == Region::Barrel
                            ? std::abs(extPos.z())
                            : VectorHelpers::perp(extPos)};
       if (ext < s_extMin[st] || ext > s_extMax[st]) {
         continue;
       }
-      /// Combined strip space points: the sensor direction is the strip
-      /// measuring the bending direction, toNextSensor the complementary strip
-      hit.sensorDir = localToGlobal.linear() * sp->sensorDirection();
-      hit.measDirs.first = localToGlobal.linear() *
-                           sp->sensorDirection().cross(Vector3::UnitZ());
-      /// The second measured direction is needed only when the complementary
-      /// strip is not orthogonal to the sensor direction
-      if (!sp->isStraw() && sp->measuresLoc0() && sp->measuresLoc1() &&
-          std::abs(sp->sensorDirection().dot(sp->toNextSensor())) > s_epsilon) {
-        hit.measDirs.second =
-            localToGlobal.linear() * sp->toNextSensor().cross(Vector3::UnitZ());
-      }
-      hit.station = station;
-      hit.sector = sector.sector();
-      hit.layerDistance = chamberOffset(station) + sp->localPosition().z();
-      hit.muonIdx = muonIdx;
-      outHits.push_back(std::move(hit));
-      m_spacePoints.push_back(std::move(sp));
+      outHits.emplace_back(*sp, bucket, localToGlobal, st, localLayerIdx(*sp), sp->isStraw());
+      bucket.push_back(std::move(sp));
     }
   }
+  /// @brief Configuration of the hit generator
   Config m_cfg{};
+  /// @brief Random engine for the hit generation
   RandomEngine m_engine;
-  StrawContainer_t m_spacePoints{};
+  /// @brief Buckets of space points of the current event, owned by the hit
+  ///        generator. Heap allocated, since the hits keep their address.
+  std::vector<std::unique_ptr<TestBucket_t>> m_buckets{};
 };
+/// @brief Type alias for the configuration of the hit generator
+using genCfg_t = GlobalPatternFinderHitGen::Config;
+
+///////////////////////////////////////////////////////////////////////////////
+/// Mocked GPF ingredients - global pattern finder hit, topology, seed selector
+/// and phi-only hit provider
+///////////////////////////////////////////////////////////////////////////////
+/// @brief Global pattern finder class
+using GlobalPatternFinder_t =
+    GlobalPatternFinder<TestBucket_t, TestSector, s_nStations>;
+/// @brief Type alias for the configuration of the GPF
+using PatternFinderCfg_t = GlobalPatternFinder_t::Config;
+/// @brief Type alias for the search tree class used by the GPF
+using SearchTree_t = GlobalPatternFinder_t::SearchTree_t;
+/// @brief Type alias for the hit coordinates used as index in the search tree
+using HitCoords = GlobalPatternFinder_t::HitCoords;
+/// @brief Fixed ordering of two different stations along the trajectory: by
+///        station layer, and barrel before endcap in the same station layer
+static std::partial_ordering stationOrder(const std::uint8_t stIdx1,
+                                          const std::uint8_t stIdx2) {
+  const auto st1{static_cast<Station>(stIdx1)};
+  const auto st2{static_cast<Station>(stIdx2)};
+  const StationLayer stLayer1{toStationLayer(st1)};
+  const StationLayer stLayer2{toStationLayer(st2)};
+  return stLayer1 != stLayer2 ? stLayer1 <=> stLayer2 : st1 <=> st2;
+}
+/// @brief Seed selector: seeds from middle & outer strip hits. A single,
+///         large theta window is used for all the station pairs, since the
+///         test probes the pattern building and not the CPU performance.
+class TestSeedSelector {
+ public:
+  /// @brief Default constructor
+  explicit TestSeedSelector(const double thetaWindow)
+      : m_thetaWindow{thetaWindow} {};
+  /// @brief Whether the hit is good for seeding a pattern: strip hits of the
+  ///        Middle and Outer stations
+  bool goodForSeeding(const Hit_t& hit) const {
+    return !hit.spacePoint().isStraw() &&
+           toStationLayer(static_cast<Station>(hit.groupIdx())) != StationLayer::Inner;
+  }
+  /// @brief Return the theta search window(s) for a given hit.
+  std::array<double, s_nStations> thetaSearchWindow(
+      const Hit_t& /*hit*/) const {
+    return filledArray<double, s_nStations>(m_thetaWindow);
+  }
+ private:
+  double m_thetaWindow{3._degree};
+};
+static_assert(PatternSeedSelector<TestSeedSelector, TestBucket_t, s_nStations>);
 /// @brief Fill the search tree.
-SearchTree_t buildSearchTree(const std::vector<TestHit>& etaHits) {
+SearchTree_t buildSearchTree(const std::vector<Hit_t>& etaHits) {
   SearchTree_t::vector_t entries{};
   entries.reserve(etaHits.size());
-  for (const TestHit& hit : etaHits) {
+  for (const Hit_t& hit : etaHits) {
     SearchTree_t::coordinate_t coords{};
     coords[toUnderlying(HitCoords::eTheta)] =
-        VectorHelpers::theta(hit.position);
-    coords[toUnderlying(HitCoords::eSector)] = hit.sector;
+        VectorHelpers::theta(hit.globalPosition());
+    coords[toUnderlying(HitCoords::eSector)] = hit.parentBucket().sectorIdx;
     entries.emplace_back(coords, &hit);
   }
   return SearchTree_t{std::move(entries)};
+}
+/// @brief Whether two hits are on the same layer of the same chamber. The
+///        buckets of the same chamber (muon and background) have different,
+///        but equal, transforms.
+bool sameLayer(const Hit_t& a, const Hit_t& b) {
+  return a.groupIdx() == b.groupIdx() && a.layerIdx() == b.layerIdx() &&
+         a.localToGlobal().isApprox(b.localToGlobal());
+}
+/// @brief Check the consistency of a pattern returned by the GPF
+///  @return: the broken invariants, empty if the pattern is consistent
+std::vector<std::string> brokenInvariants(
+    const GlobalPatternFinder_t::OutputPattern& pattern) {
+  std::vector<std::string> broken{};
+  std::vector<const Hit_t*> etaHits{};
+  for (const auto [group, groupHits] : enumerate(pattern.hitsPerGroup)) {
+    for (const Hit_t* hit : groupHits) {
+      if (hit->groupIdx() != group) {
+        broken.emplace_back("eta hit stored in the wrong group");
+      }
+      etaHits.push_back(hit);
+    }
+  }
+  const auto nPrecision{static_cast<std::size_t>(std::ranges::count_if(
+      etaHits, [](const Hit_t* hit) { return hit->isPrecision(); }))};
+  if (nPrecision != pattern.nPrecisionLayers ||
+      etaHits.size() - nPrecision != pattern.nTriggerLayers) {
+    broken.emplace_back("precision/trigger layer counts differ from the hits");
+  }
+  auto isParentBucket = [&pattern](const Hit_t& hit) {
+    return std::ranges::find(pattern.parentBuckets,
+                             std::addressof(hit.parentBucket())) !=
+           pattern.parentBuckets.end();
+  };
+  for (const auto [i, hitA] : enumerate(etaHits)) {
+    if (!isParentBucket(*hitA)) {
+      broken.emplace_back("eta hit bucket missing in the parent buckets");
+    }
+    for (const Hit_t* hitB : std::span{etaHits}.subspan(i + 1)) {
+      if (hitA == hitB) {
+        broken.emplace_back("eta hit added twice");
+      } else if (sameLayer(*hitA, *hitB)) {
+        broken.emplace_back("two eta hits on the same layer");
+      }
+    }
+  }
+  for (const auto [i, hitA] : enumerate(pattern.phiOnlyHits)) {
+    if (hitA.spacePoint().measuresLoc1()) {
+      broken.emplace_back("phi-only hit measuring the bending coordinate");
+    }
+    if (!isParentBucket(hitA)) {
+      broken.emplace_back("phi-only hit bucket missing in the parent buckets");
+    }
+    if (std::ranges::any_of(etaHits, [&hitA](const Hit_t* etaHit) {
+          return etaHit->spacePoint().measuresLoc0() &&
+                 sameLayer(*etaHit, hitA);
+        })) {
+      broken.emplace_back("phi-only hit on a layer with an eta hit measuring phi");
+    }
+    for (const Hit_t& hitB : std::span{pattern.phiOnlyHits}.subspan(i + 1)) {
+      if (sameLayer(hitA, hitB)) {
+        broken.emplace_back("two phi-only hits on the same layer");
+      }
+    }
+  }
+  for (const TestBucket_t* bucket : pattern.parentBuckets) {
+    if (std::ranges::count(pattern.parentBuckets, bucket) > 1) {
+      broken.emplace_back("parent bucket added twice");
+    }
+  }
+  return broken;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -697,8 +714,14 @@ struct TestConfig {
   /// @brief Required fraction of the muon phi-only hits attached to their
   ///        pattern (the background lines have no phi-only strips)
   double minPhiOnlyFraction{0.95};
+  /// @brief Whether to check the invariants of the found patterns
+  bool checkInvariants{true};
   /// @brief Seed of the random number generator
   RandomEngine::result_type seed{1602};
+  /// @brief Configuration of the hit generator
+  genCfg_t genCfg{};
+  /// @brief Configuration of the global pattern finder.
+  PatternFinderCfg_t gpfCfg{};
 };
 struct TestResult {
   /// @brief Fraction of the muons whose pattern was found
@@ -712,14 +735,15 @@ struct TestResult {
   /// @brief Fraction of the phi-only hits of the muons attached to their
   ///        best pattern
   double phiOnlyFraction{0.};
+  /// @brief Number of patterns breaking at least one invariant
+  std::size_t nBrokenPatterns{0};
 };
-using genCfg_t = GlobalPatternFinderHitGen::Config;
+
 
 #define DECLARE_BRANCH(dType, bName) \
   dType bName{};                     \
   outTree->Branch(#bName, &bName);
-TestResult runPatternTest(const TestConfig& testCfg, genCfg_t&& genCfg,
-                          TFile& outFile) {
+TestResult runPatternTest(const TestConfig& testCfg, TFile& outFile) {
   auto outTree =
       std::make_unique<TTree>("GlobalPatternFinderTree", "MonitorTree");
   outTree->SetDirectory(nullptr);
@@ -755,14 +779,19 @@ TestResult runPatternTest(const TestConfig& testCfg, genCfg_t&& genCfg,
   DECLARE_BRANCH(double, patPhi);
   DECLARE_BRANCH(double, meanNormRes2);
 
-  const GeometryContext gctx{GeometryContext::dangerouslyDefaultConstruct()};
-  const TestSeedSelector selector{testCfg.thetaSearchWindow};
-  const GlobalPatternFinder_t finder{
-      GlobalPatternFinder_t::Config{},
-      getDefaultLogger("GlobalPatternFinder", gpfLogLvl)};
+  genCfg_t genCfgCopy{testCfg.genCfg};
+  GlobalPatternFinderHitGen hitGenerator{std::move(genCfgCopy), testCfg.seed};
 
-  GlobalPatternFinderHitGen hitGenerator{std::move(genCfg), testCfg.seed};
-  std::size_t nFound{0}, nFakes{0}, nTruePhiOnly{0}, nMatchedPhiOnly{0};
+  PatternFinderCfg_t gpfCfgCopy{testCfg.gpfCfg};
+  gpfCfgCopy.groupOrder.connect<&stationOrder>();
+  gpfCfgCopy.phiOnlyLayerIdx.connect<&GlobalPatternFinderHitGen::localLayerIdx>(&hitGenerator);
+  const GlobalPatternFinder_t finder{
+      std::move(gpfCfgCopy),
+      getDefaultLogger("GlobalPatternFinder", gpfLogLvl)};
+  const TestSeedSelector selector{testCfg.thetaSearchWindow};
+  
+  std::size_t nFound{0}, nFakes{0}, nTruePhiOnly{0}, nMatchedPhiOnly{0},
+      nBrokenPatterns{0};
   double totGpfTime{0.};
   const TimePoint_t start = std::chrono::system_clock::now();
   const std::size_t nMuons{testCfg.nMuonsPerEvent};
@@ -772,7 +801,7 @@ TestResult runPatternTest(const TestConfig& testCfg, genCfg_t&& genCfg,
     hitGenerator.newEvent();
     event = evt;
     std::vector<MuonTruth> muons{};
-    std::vector<TestHit> etaHits{}, phiOnlyHits{};
+    std::vector<Hit_t> etaHits{};
     std::vector<unsigned> nEtaHitsPerMuon(nMuons, 0),
         nPhiHitsPerMuon(nMuons, 0);
     std::vector<std::bitset<s_nStations>> stationsPerMuon(nMuons);
@@ -780,21 +809,21 @@ TestResult runPatternTest(const TestConfig& testCfg, genCfg_t&& genCfg,
     for (std::size_t iMuon = 0; iMuon < nMuons; ++iMuon) {
       const MuonTruth& muon{muons.emplace_back(hitGenerator.generateMuon())};
 
-      for (TestHit& hit :
+      for (Hit_t& hit :
            hitGenerator.spawnHits(muon, static_cast<int>(iMuon))) {
-        if (hit.sp->measuresLoc1()) {
-          if (hit.muonIdx >= 0) {
+        if (hit.spacePoint().measuresLoc1()) {
+          if (hit.parentBucket().muonIdx >= 0) {
             ++nEtaHitsPerMuon[iMuon];
-            stationsPerMuon[iMuon].set(toUnderlying(hit.station));
+            stationsPerMuon[iMuon].set(hit.groupIdx());
           } else {
             ++nBkgEtaHits;
           }
           etaHits.push_back(std::move(hit));
         } else {
-          if (hit.muonIdx >= 0) {
+          /// Phi-only hits
+          if (hit.parentBucket().muonIdx >= 0) {
             ++nPhiHitsPerMuon[iMuon];
           }
-          phiOnlyHits.push_back(std::move(hit));
         }
       }
       ACTS_DEBUG("Event " << evt << ", muon " << iMuon << ": E = "
@@ -807,9 +836,8 @@ TestResult runPatternTest(const TestConfig& testCfg, genCfg_t&& genCfg,
     std::vector<GlobalPatternFinder_t::OutputPattern> patterns{};
     if (!etaHits.empty()) {
       const SearchTree_t tree{buildSearchTree(etaHits)};
-      const TestPhiProvider phiProvider{std::move(phiOnlyHits)};
       const TimePoint_t gpfStart = std::chrono::system_clock::now();
-      patterns = finder.findPatterns(gctx, tree, selector, phiProvider,
+      patterns = finder.findPatterns(tree, selector,
                                      testCfg.beamSpot);
       gpfTime = std::chrono::duration<double, std::micro>(
                     std::chrono::system_clock::now() - gpfStart)
@@ -827,11 +855,20 @@ TestResult runPatternTest(const TestConfig& testCfg, genCfg_t&& genCfg,
     std::vector<unsigned> nHits(patterns.size(), 0);
     std::vector<int> patternMuon(patterns.size(), -1);
     for (const auto [iPat, pattern] : enumerate(patterns)) {
+      if (testCfg.checkInvariants) {
+        if (const std::vector<std::string> broken{brokenInvariants(pattern)};
+            !broken.empty()) {
+          ++nBrokenPatterns;
+          for (const std::string& msg : broken) {
+            ACTS_ERROR("Event " << evt << ", pattern " << iPat << ": " << msg);
+          }
+        }
+      }
       for (const auto& groupHits : pattern.hitsPerGroup) {
-        for (const TestHit* hit : groupHits) {
+        for (const Hit_t* hit : groupHits) {
           ++nHits[iPat];
-          if (hit->muonIdx >= 0) {
-            ++nMatched[iPat][hit->muonIdx];
+          if (hit->parentBucket().muonIdx >= 0) {
+            ++nMatched[iPat][hit->parentBucket().muonIdx];
           }
         }
       }
@@ -881,8 +918,8 @@ TestResult runPatternTest(const TestConfig& testCfg, genCfg_t&& genCfg,
         nPatPhi = pattern.nPhiLayers;
         nPatPhiOnly = pattern.phiOnlyHits.size();
         nPatPhiOnlyMatched =
-            std::ranges::count_if(pattern.phiOnlyHits, [&](const TestHit& hit) {
-              return hit.muonIdx == static_cast<int>(iMuon);
+            std::ranges::count_if(pattern.phiOnlyHits, [&](const Hit_t& hit) {
+              return hit.parentBucket().muonIdx == static_cast<int>(iMuon);
             });
         patSector = pattern.sector.sector();
         patTheta = pattern.patTheta / 1._degree;
@@ -922,6 +959,7 @@ TestResult runPatternTest(const TestConfig& testCfg, genCfg_t&& genCfg,
   result.phiOnlyFraction =
       nTruePhiOnly > 0 ? static_cast<double>(nMatchedPhiOnly) / nTruePhiOnly
                        : 0.;
+  result.nBrokenPatterns = nBrokenPatterns;
   outFile.WriteObject(outTree.get(), outTree->GetName());
   ACTS_INFO("Test finished. Found "
             << nFound << "/" << nEvents * nMuons << " muons, " << nFakes
@@ -939,9 +977,84 @@ BOOST_AUTO_TEST_CASE(MuonPatternFinding) {
   auto outFile =
       std::make_unique<TFile>("GlobalPatternFinderTest.root", "RECREATE");
   const TestConfig testCfg{};
-  const TestResult result{runPatternTest(testCfg, genCfg_t{}, *outFile)};
+  const TestResult result{runPatternTest(testCfg, *outFile)};
   BOOST_CHECK_GE(result.foundFraction, testCfg.minFoundFraction);
   BOOST_CHECK_GE(result.phiOnlyFraction, testCfg.minPhiOnlyFraction);
+  BOOST_CHECK_EQUAL(result.nBrokenPatterns, 0u);
+}
+
+/// @brief The GPF assumes that the layer index of the hits increases strictly
+///        along the local z-axis and is the same for all the hits of a layer
+BOOST_AUTO_TEST_CASE(HitGeneratorLayerIndex) {
+  GlobalPatternFinderHitGen hitGenerator{genCfg_t{}, 1602};
+  std::size_t nPairs{0}, nBadPairs{0};
+  for (int iMuon = 0; iMuon < 100; ++iMuon) {
+    const std::vector<Hit_t> hits{
+        hitGenerator.spawnHits(hitGenerator.generateMuon(), iMuon)};
+    for (const Hit_t& hitA : hits) {
+      for (const Hit_t& hitB : hits) {
+        if (&hitA == &hitB ||
+            std::addressof(hitA.parentBucket()) !=
+                std::addressof(hitB.parentBucket())) {
+          continue;
+        }
+        ++nPairs;
+        const double dZ{hitB.spacePoint().localPosition().z() -
+                        hitA.spacePoint().localPosition().z()};
+        const bool good{std::abs(dZ) < 1._um
+                            ? hitA.layerIdx() == hitB.layerIdx()
+                            : (dZ > 0.) == (hitA.layerIdx() < hitB.layerIdx())};
+        if (!good) {
+          ++nBadPairs;
+          ACTS_ERROR("Layer indices " << static_cast<int>(hitA.layerIdx())
+                                      << " and "
+                                      << static_cast<int>(hitB.layerIdx())
+                                      << " for hits at a local distance "
+                                      << dZ << " along z");
+        }
+      }
+    }
+  }
+  BOOST_CHECK_GT(nPairs, 0u);
+  BOOST_CHECK_EQUAL(nBadPairs, 0u);
+}
+
+/// @brief Invalid group orderings
+std::partial_ordering alwaysLess(const std::uint8_t /*a*/,
+                                 const std::uint8_t /*b*/) {
+  return std::partial_ordering::less;
+}
+std::partial_ordering alwaysEquivalent(const std::uint8_t /*a*/,
+                                       const std::uint8_t /*b*/) {
+  return std::partial_ordering::equivalent;
+}
+std::partial_ordering lessOrUnordered(const std::uint8_t a,
+                                      const std::uint8_t b) {
+  return a < b ? std::partial_ordering::less
+               : std::partial_ordering::unordered;
+}
+
+/// @brief The GPF constructor rejects invalid configurations
+BOOST_AUTO_TEST_CASE(ConfigValidation) {
+  auto makeFinder = [](PatternFinderCfg_t cfg) {
+    return GlobalPatternFinder_t{
+        std::move(cfg), getDefaultLogger("GlobalPatternFinder", gpfLogLvl)};
+  };
+  PatternFinderCfg_t cfg{};
+  cfg.attachPhiOnlyHits = false;
+  BOOST_CHECK_NO_THROW(makeFinder(cfg));
+  cfg.groupOrder.connect<&stationOrder>();
+  BOOST_CHECK_NO_THROW(makeFinder(cfg));
+  cfg.groupOrder.connect<&alwaysLess>();
+  BOOST_CHECK_THROW(makeFinder(cfg), std::invalid_argument);
+  cfg.groupOrder.connect<&alwaysEquivalent>();
+  BOOST_CHECK_THROW(makeFinder(cfg), std::invalid_argument);
+  cfg.groupOrder.connect<&lessOrUnordered>();
+  BOOST_CHECK_THROW(makeFinder(cfg), std::invalid_argument);
+  /// The phi-only hit search needs the layer index of the phi-only hits
+  cfg.groupOrder.connect<&stationOrder>();
+  cfg.attachPhiOnlyHits = true;
+  BOOST_CHECK_THROW(makeFinder(cfg), std::invalid_argument);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

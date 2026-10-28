@@ -8,94 +8,102 @@
 
 #pragma once
 
+#include "Acts/Definitions/Algebra.hpp"
 #include "Acts/Definitions/Units.hpp"
 #include "Acts/EventData/CompositeSpacePoint.hpp"
-#include "Acts/Geometry/GeometryContext.hpp"
 #include "Acts/Utilities/Helpers.hpp"
 #include "Acts/Utilities/Logger.hpp"
 #include "Acts/Utilities/MathHelpers.hpp"
 
 #include <bitset>
-#include <compare>
 #include <cstdint>
 #include <format>
-#include <type_traits>
+#include <sstream>
 
-/// Auxiliary concepts and data structures used by the Global Pattern Finder.
+/// Auxiliary data structures and concepts used by the Global Pattern Finder.
 ///
-/// This file defines the concepts used to abstract the detector-specific hit
-/// type, pattern topology, and sectorization, together with the main
-/// PatternStateAux object used internally by the Global Pattern Finder.
+/// This file defines the hit object used by the Global Pattern Finder, the
+/// concept used to abstract the detector-specific sectorization, together
+/// with the main PatternStateAux object used internally by the Global Pattern
+/// Finder.
 
 namespace Acts::Experimental::detail {
-using namespace Acts::UnitLiterals;
-/// @brief Definition of the measured directions for strip measurements. The first
-///  is the primary strip measurement direction and is by definition orthogonal
-/// to the sensor direction. The second direction is the secondary strip
-/// measurement direction and is provided only when it differs from the sensor
-/// direction.
-using StripMeasurementDirections = std::pair<Vector3, std::optional<Vector3>>;
 
-/// @brief Concept definition for global pattern finder hits. This concept
-///  is defined as the representation of @ref CompositeSpacePoint in global
-///  coordinates, with additional methods needed for the global pattern finder.
-///  The transformation of representation from in-station to global detector
-///  coordinates introduces a dependency on the geometry alignment, represented
-///  by the @ref GeometryContext.
-template <typename Hit_t>
-concept GlobPatFinderHit =
-    requires(const Hit_t hit, const GeometryContext& gctx,
-             const Vector3& contractionVector, const Hit_t& otherHit) {
-      /// Retrieve a reference to the underlying composite space point. This is
-      /// a proxy to all the properties of the composite space point.
-      { hit.spacePoint() };
-      requires std::is_lvalue_reference_v<decltype(hit.spacePoint())> &&
-                   CompositeSpacePoint<
-                       std::remove_cvref_t<decltype(hit.spacePoint())>>;
-      /// Cached global position of the space point measurement. It's the
-      /// position of the space point in global coordinates.
-      { hit.globalPosition(gctx) } -> std::convertible_to<Vector3>;
-      /// Orientation of the sensor, which is either the wire or strip
-      /// orientation. When the spacepoint is built from two strip measurements,
-      /// the sensor orientation refers to the measurement in the bending
-      /// coordinate. This method can either be implemented to return the vector
-      /// by value or by reference.
-      { hit.globalSensorDirection(gctx) } -> std::convertible_to<Vector3>;
-      /// Return the measured directions for strip measurements. The first,
-      /// always present, is orthogonal to the sensor direction. The second
-      /// is provided only for combined strip space points with non-orthogonal
-      /// strips, and corresponds to the measured direction of the second strip,
-      /// which differs from the first strip, i.e. the sensor direction.
-      {
-        hit.stripMeasurementDirections(gctx)
-      } -> std::same_as<StripMeasurementDirections>;
-      /// Whether the hit is a precision measurement
-      { hit.isPrecision() } -> std::same_as<bool>;
-      /// Whether two hits represent overlapping detector information. This
-      /// relation may be less restrictive than requiring equality and is used
-      /// when determining whether reconstructed patterns share detector
-      /// information.
-      { hit.overlaps(otherHit) } -> std::same_as<bool>;
-    };
-/// @brief Concept defining the detector topology used by the pattern finder. The
-///  detector is assumed to be organized in layers, which are grouped into a
-///  number of groups. The topology describes how detector layers are ordered
-///  and organized into groups, and how hits are associated with the
-///  corresponding layer/group.
-template <typename T, typename Hit_t>
-concept PatternTopology =
-    GlobPatFinderHit<Hit_t> && requires(const Hit_t& hit1, const Hit_t& hit2) {
-      /// Number of groups in the topology. Group and layer indices
-      /// are represented as std::uint8_t, which is assumed to be able to
-      /// represent all the layers that can be crossed by a particle.
-      requires std::same_as<decltype(T::nGroups), const std::uint8_t>;
-      /// Compare two hits by measurement layer. The result is less if hit1 is
-      /// on an inner layer w.r.t. hit2, greater if it is on an outer layer,
-      /// and equivalent if the two hits are on the same measurement layer.
-      { T::compareLayers(hit1, hit2) } -> std::same_as<std::weak_ordering>;
-      /// Return the group index of a hit.
-      { T::groupIndex(hit1) } -> std::same_as<std::uint8_t>;
-    };
+/// @brief Hit used by the Global Pattern Finder: a space point together with 
+///  the information needed by the pattern finder. Space-points are generally 
+///  grouped into buckets, which satisfy the @ref CompositeSpacePointContainer
+///  concept. All the space points of a bucket are expressed in the same local
+///  frame, defined by a common local-to-global transform.
+///  The global position is cached at construction time, while the global 
+///  sensor/strip directions are computed on the fly from the local-to-global
+///  transform.
+template <CompositeSpacePointContainer Bucket_t>
+class GlobPatFinderHit {
+ public:
+  /// @brief Type of the underlying space point
+  using SpacePoint_t = RemovePointer_t<typename Bucket_t::value_type>;
+  /// @brief Constructor given the transform defining the local frame of the bucket
+  ///  @param sp: underlying space point
+  ///  @param bucket: bucket holding the space point
+  ///  @param localToGlobal: transform from the local frame of the bucket to the
+  ///         global frame. Only its address is stored, so it must outlive the
+  ///         hit. Hits in the same local frame must share the same instance.
+  ///  @param groupIdx: group index of the hit in the pattern topology
+  ///  @param layerIdx: layer index of the hit in the local frame, increasing
+  ///         along the local z-axis (i.e. outwards)
+  ///  @param isPrecision: whether the hit is a precision measurement
+  GlobPatFinderHit(const SpacePoint_t& sp, const Bucket_t& bucket,
+                   const Transform3& localToGlobal,
+                   const std::uint8_t groupIdx, const std::uint8_t layerIdx,
+                   const bool isPrecision)
+      : m_position{localToGlobal * sp.localPosition()},
+        m_sp{std::addressof(sp)},
+        m_bucket{std::addressof(bucket)},
+        m_localToGlobal{std::addressof(localToGlobal)},
+        m_groupIdx{groupIdx},
+        m_layerIdx{layerIdx},
+        m_precision{isPrecision} {}
+  /// @brief Return the underlying space point
+  const SpacePoint_t& spacePoint() const { return *m_sp; }
+  /// @brief Return the transform associated with the local frame of the bucket
+  const Transform3& localToGlobal() const { return *m_localToGlobal; }
+  /// @brief Return the global position of the space point
+  const Vector3& globalPosition() const { return m_position; }
+  /// @brief Return the sensor direction in the global frame
+  Vector3 globalSensorDirection() const {
+    return m_localToGlobal->linear() * spacePoint().sensorDirection();
+  }
+  /// @brief Return the unit vector pointing to the next sensor in the global frame
+  Vector3 globalToNextSensor() const {
+    return m_localToGlobal->linear() * spacePoint().toNextSensor();
+  }
+  /// @brief Return the parent bucket of the space point
+  const Bucket_t& parentBucket() const { return *m_bucket; }
+  /// @brief Return the group index of the hit
+  std::uint8_t groupIdx() const { return m_groupIdx; }
+  /// @brief Return the layer index of the hit in the local frame. It increases
+  ///        along the local z-axis (outwards), consistently with the geometric
+  ///        ordering of hits in different local frames.
+  std::uint8_t layerIdx() const { return m_layerIdx; }
+  /// @brief Return whether the hit is a precision measurement
+  bool isPrecision() const { return m_precision; }
+
+ private:
+  /// @brief Global position of the space point
+  Vector3 m_position{Vector3::Zero()};
+  /// @brief Pointer to the underlying space point
+  const SpacePoint_t* m_sp{nullptr};
+  /// @brief Pointer to the bucket holding the space point
+  const Bucket_t* m_bucket{nullptr};
+  /// @brief Pointer to the transform from local to global coordinates
+  const Transform3* m_localToGlobal{nullptr};
+  /// @brief Group index in the pattern topology
+  std::uint8_t m_groupIdx{0u};
+  /// @brief Layer index in the local frame
+  std::uint8_t m_layerIdx{0u};
+  /// @brief Precision flag
+  bool m_precision{false};
+};
 /// @brief Sectorization of the detector in the non-bending coordinate.
 ///  In this first implementation of Global Pattern Finder with toroidal
 ///  azimuthal field, the sectors are defined along the phi direction.
@@ -119,14 +127,16 @@ concept SectorType =
       { sector.insideSector(phi) } -> std::same_as<bool>;
     };
 /// @brief Pattern state object storing pattern information during construction
-template <GlobPatFinderHit Hit_t, SectorType Sector_t,
-          PatternTopology<Hit_t> Topology_t>
+template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+          std::uint8_t nGroups>
 struct PatternStateAux {
+  /// @brief Hit type used by the pattern
+  using Hit_t = GlobPatFinderHit<Bucket_t>;
   /// @brief Configuration object of the residual calculator
   struct Config {
     /// @brief Minimum distance between two hits for being used to
     ///         compute a reliable pattern line. Use the beamspot otherwise.
-    double minHitDistance4Line{200._mm};
+    double minHitDistance4Line{200. * UnitConstants::mm};
   };
   /// @brief Beamspot information, used as an additional constraint on the
   ///  pattern line when the lever arm of the hits is too small. The beamspot
@@ -142,9 +152,9 @@ struct PatternStateAux {
     /// @brief Beamspot position
     Vector3 position{Vector3::Zero()};
     /// @brief Beamspot radius
-    double radius{30._cm};
+    double radius{30. * UnitConstants::cm};
     /// @brief Beamspot (half-)length
-    double length{2._m};
+    double length{2. * UnitConstants::m};
   };
   /// @brief Small wrapper for hits used to build patterns. In general, due to detector
   ///         complexity, the layer number cannot be defined globally, but it
@@ -172,6 +182,20 @@ struct PatternStateAux {
     /// @brief Print the OrderedHit information to a stream
     void print(std::ostream& ostr) const;
   };
+  /// @brief We will need to retrieve the parent buckets and their associated
+  ///        transforms for each group. We can then store a representative hit per bucket
+  using BucketRefs_t =
+    std::array<std::vector<const OrderedHit*>, nGroups>;
+  /// @brief Phi-only hit attached to the pattern, together with the point on
+  ///        the strip crossed by the pattern line. The strip position is in
+  ///        general not the crossing point (e.g. the strip centre), so the
+  ///        crossing point is used for the phi of the hit.
+  struct PhiOnlyHit {
+    /// @brief The phi-only hit
+    Hit_t hit;
+    /// @brief Point on the strip crossed by the pattern line
+    Vector3 crossPos{Vector3::Zero()};
+  };
   /// @brief Enum for the pattern state variables, needed when updating the pattern state
   enum class PatternState : std::int8_t {
     eBendPlane,   ///< Bending plane
@@ -196,14 +220,13 @@ struct PatternStateAux {
   };
   using BendPlaneCov_t = std::array<double, 3>;
   /// @brief Constructor taking the seed information
-  ///  @param gctx: geometry context
   ///  @param seed: seed hit
   ///  @param sectorIdx: sector index of the seed hit
   ///  @param config: configuration object
-  ///  @param logger: pointer to messaging object
-  explicit PatternStateAux(const GeometryContext& gctx, const OrderedHit& seed,
+  ///  @param logger: messaging object
+  explicit PatternStateAux(const OrderedHit& seed,
                            const typename Sector_t::Index_t sectorIdx,
-                           const Config& config, const Logger* logger);
+                           const Config& config, const Logger& logger);
   /// @brief Move constructor
   ///  @param other: other pattern state to move from
   PatternStateAux(PatternStateAux&& other) noexcept = default;
@@ -218,7 +241,8 @@ struct PatternStateAux {
   PatternStateAux& operator=(const PatternStateAux& other) = default;
   /// @brief Default destructor
   ~PatternStateAux() = default;
-
+  
+  /// ********* Add and remove hits from the pattern *********
   /// @brief Add a hit to the pattern and update the internal state
   ///  @param hit: hit to be added
   ///  @param testRes: line compatibility test result of the hit
@@ -227,62 +251,40 @@ struct PatternStateAux {
   ///  @param newHit: new hit to replace with
   ///  @param newTestRes: line compatibility test result of the new hit
   void overWriteHit(const OrderedHit& newHit, const LineTestRes& newTestRes);
+  /// ********* Residual computation *********
   /// @brief Contract the intrinsic covariance of the hit with a vector, i.e.
   ///        compute the variance of the hit position along that vector. It is
   ///        used both for the residual uncertainty and for the weight of the
   ///        hit in the bending plane regression.
-  ///  @param gctx: geometry context
   ///  @param hit: hit for which to compute the contracted covariance
   ///  @param contractionVector: vector used to contract the covariance
   ///  @param isProjected: flag indicating if the hit is projected onto the
   ///         bending plane. Only used in the residual computation, false
   ///         otherwise.
   ///  @return: the contracted covariance of the hit
-  static double covarianceContraction(const GeometryContext& gctx,
-                                      const Hit_t& hit,
+  static double covarianceContraction(const Hit_t& hit,
                                       const Vector3& contractionVector,
                                       bool isProjected = false);
   /// @brief Method to compute the residual of a test hit against the pattern line
-  ///  @param gctx: geometry context
   ///  @param testHit: test hit information
   ///  @param beamSpot: position of the beam spot
   ///  @return: Test result holding the residual, its uncertainty, and number of degrees of freedom.
-  LineTestRes computeLineResidual(const GeometryContext& gctx,
-                                  const OrderedHit& testHit,
+  LineTestRes computeLineResidual(const OrderedHit& testHit,
                                   const BeamspotInfo& beamSpot) const;
+  /// ********* Bending plane computation and hit projection *********
   /// @brief Project a certain hit position onto the bending plane where the pattern is defined.
   ///         The hit is moved along the sensor direction.
-  ///  @param gctx: geometry context
   ///  @param hit: hit whose position is to be projected
   ///  @return: projected position
-  Vector3 projToPhiPlane(const GeometryContext& gctx, const Hit_t& hit) const;
-  /// @brief Check whether a hit is present in the pattern
-  ///  @param hit: hit to be checked
-  ///  @return: true if the hit is in the pattern
-  bool isInPattern(const Hit_t& hit) const;
-  /// @brief Move the line anchor hit given a reference hit. The anchor is defined
-  ///         as the closest hit in the closest group to the reference hit.
-  ///  @param refHit: reference hit
-  void moveLineAnchorHit(const OrderedHit& refHit);
+  Vector3 projToPhiPlane(const Hit_t& hit) const;
   /// @brief Update the line parameters based on the current hits
-  ///  @param gctx: geometry context
   ///  @param beamSpot: beam spot information, needed when there are not enough hits
-  void updateLineParameters(const GeometryContext& gctx,
-                            const BeamspotInfo& beamSpot);
+  void updateLineParameters(const BeamspotInfo& beamSpot);
   /// @brief Helper method to update the pattern phi and bending plane normal
-  ///  @param gctx: geometry context
   ///  @param beamSpot: position of the beam spot
-  void updateBendPlane(const GeometryContext& gctx,
-                       const BeamspotInfo& beamSpot);
+  void updateBendPlane(const BeamspotInfo& beamSpot);
   /// @brief Helper method to set the bending plane from the sector
   void setBendPlaneFromSector();
-  /// @brief Synchronize the pattern with the current state
-  ///  @param gctx: geometry context
-  ///  @param beamSpot: position of the beam spot
-  void syncState(const GeometryContext& gctx, const BeamspotInfo& beamSpot);
-  /// @brief Book pattern state variables that need to be updated when syncState is called
-  ///  @param vars: list of variables to update
-  void setStateVars(const std::initializer_list<PatternState>& vars);
   /// @brief Signed angle under which the pattern sees a point, relative to its bending plane.
   ///  @param pos: position to check
   ///  @return: the angle between the position and the bending plane
@@ -291,37 +293,62 @@ struct PatternStateAux {
   double phiAtRadius(const double R) const;
   /// @brief Return the unit vector along the bending plane
   Vector3 bendPlaneDir() const;
+  /// ********** Phi-only strip utilities **********
   /// @brief Define the pattern line locally around a reference hit, using eta hits in its group
   ///         or, failing that, the closest hits in the groups below and above.
-  ///  @param gctx: geometry context
   ///  @param refHit: reference hit
   ///  @return true if a line with sufficient lever arm was found
-  bool defineLineAroundHit(const GeometryContext& gctx, const Hit_t& refHit);
+  bool defineLineAroundHit(const OrderedHit& refHit);
   /// @brief Compute where the pattern line crosses a phi-only strip. The
   ///        strip ends are projected onto the bending plane of the pattern
   ///        and the projected strip is intersected with the pattern line.
-  ///  @param gctx: geometry context
   ///  @param phiHit: phi-only hit
   ///  @return: pair of the point on the strip crossed by the pattern line and
   ///           the distance of this point from the closest strip edge, along
   ///           the strip projected onto the bending plane (negative if the
   ///           pattern line crosses the strip within its edges)
-  std::pair<Vector3, double> phiStripCrossing(const GeometryContext& gctx,
-                                              const Hit_t& phiHit) const;
-  /// @brief Return the mean normalized residual squared
-  double getMeanResidual2() const;
+  std::pair<Vector3, double> phiStripCrossing(const Hit_t& phiHit) const;
+  /// @brief Residual of a phi hit from the bending plane: signed distance of the
+  ///        hit position from the plane, with the uncertainty of the hit across
+  ///        the plane and of the plane parameters at the hit position.
+  ///  @param phiHit: hit measuring phi
+  ///  @param pos: position of the hit, e.g. the point on a phi-only strip
+  ///         crossed by the pattern line
+  ///  @return: the residual, its uncertainty and one degree of freedom
+  LineTestRes phiHitResidual(const Hit_t& phiHit, const Vector3& pos) const;
+  /// *********** Pattern state variables *********
+  /// @brief Move the line anchor hit to the closest hit in the closest (but different) group to the reference hit.
+  ///  @param refHit: reference hit
+  void resetLineAnchorHit(const OrderedHit& refHit);
+  /// @brief Synchronize the pattern with the current state
+  ///  @param beamSpot: position of the beam spot
+  void syncState(const BeamspotInfo& beamSpot);
+  /// @brief Book pattern state variables that need to be updated when syncState is called
+  ///  @param vars: list of variables to update
+  void setStateVars(const std::initializer_list<PatternState>& vars);
+  /// ************ Pattern information getters ************
+  /// @brief Check whether a hit is present in the pattern
+  ///  @param hit: hit to be checked
+  ///  @return: true if the hit is in the pattern
+  bool isInPattern(const Hit_t& hit) const;
+  /// @brief Collect the distinct parent buckets of the pattern hits, per group.
+  ///  One pattern hit per distinct bucket is used as reference.
+  ///  @return: reference hits of the distinct parent buckets, per group
+  BucketRefs_t bucketRefs() const;
   /// @brief Method returning the number of groups
   ///  @return: number of groups in the pattern
   std::uint8_t countGroups() const;
+  /// @brief Return the mean normalized residual squared
+  double getMeanResidual2() const;
   /// @brief Return the number of layers in bending coordinate
   ///  @return: number of layers in the bending coordinate
   std::uint8_t nBendingLayers() const;
-
+  /// ************ Retrieve the logger **********
   /// @brief Return the logger
   const Logger& logger() const { return *m_logger; }
 
   /// @brief Configuration options
-  Config cfg{};
+  const Config* m_cfg{nullptr};
   /// @brief Logger
   const Logger* m_logger{nullptr};
   /// @brief Last inserted hit. Needed to speed-up lookup
@@ -371,17 +398,7 @@ struct PatternStateAux {
   bool useBeamspot{false};
 
   /// @brief Collection of hits per group. A pattern is determined by the hits belonging to it.
-  std::array<std::vector<OrderedHit>, Topology_t::nGroups> hitsPerGroup{};
-  /// @brief Phi-only hit attached to the pattern, together with the point on
-  ///        the strip crossed by the pattern line. The strip position is in
-  ///        general not the crossing point (e.g. the strip centre), so the
-  ///        crossing point is used for the phi of the hit.
-  struct PhiOnlyHit {
-    /// @brief The phi-only hit
-    Hit_t hit;
-    /// @brief Point on the strip crossed by the pattern line
-    Vector3 crossPos{Vector3::Zero()};
-  };
+  std::array<std::vector<OrderedHit>, nGroups> hitsPerGroup{};
   /// @brief Phi-only hits attached to the pattern
   std::vector<PhiOnlyHit> phiOnlyHits{};
 
