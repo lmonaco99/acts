@@ -37,9 +37,15 @@ namespace Acts::Experimental::detail {
 ///  The global position is cached at construction time, while the global 
 ///  sensor/strip directions are computed on the fly from the local-to-global
 ///  transform.
+/* 
+template <Sp_t>
+class GlobPatFinderHit: public Sp_t {
+ public:
+ */
 template <CompositeSpacePointContainer Bucket_t>
 class GlobPatFinderHit {
  public:
+ 
   /// @brief Type of the underlying space point
   using SpacePoint_t = RemovePointer_t<typename Bucket_t::value_type>;
   /// @brief Constructor given the transform defining the local frame of the bucket
@@ -60,6 +66,8 @@ class GlobPatFinderHit {
         m_sp{std::addressof(sp)},
         m_bucket{std::addressof(bucket)},
         m_localToGlobal{std::addressof(localToGlobal)},
+        m_sensorDir{localToGlobal.linear() * sp.sensorDirection()},
+        m_toNextDir{localToGlobal.linear() * sp.toNextSensor()},
         m_groupIdx{groupIdx},
         m_layerIdx{layerIdx},
         m_precision{isPrecision} {}
@@ -70,13 +78,9 @@ class GlobPatFinderHit {
   /// @brief Return the global position of the space point
   const Vector3& globalPosition() const { return m_position; }
   /// @brief Return the sensor direction in the global frame
-  Vector3 globalSensorDirection() const {
-    return m_localToGlobal->linear() * spacePoint().sensorDirection();
-  }
+  const Vector3& globalSensorDirection() const { return m_sensorDir; }
   /// @brief Return the unit vector pointing to the next sensor in the global frame
-  Vector3 globalToNextSensor() const {
-    return m_localToGlobal->linear() * spacePoint().toNextSensor();
-  }
+  const Vector3& globalToNextSensor() const { return m_toNextDir; }
   /// @brief Return the parent bucket of the space point
   const Bucket_t& parentBucket() const { return *m_bucket; }
   /// @brief Return the group index of the hit
@@ -97,6 +101,8 @@ class GlobPatFinderHit {
   const Bucket_t* m_bucket{nullptr};
   /// @brief Pointer to the transform from local to global coordinates
   const Transform3* m_localToGlobal{nullptr};
+  Vector3 m_sensorDir{Vector3::Zero()};
+  Vector3 m_toNextDir{Vector3::Zero()};
   /// @brief Group index in the pattern topology
   std::uint8_t m_groupIdx{0u};
   /// @brief Layer index in the local frame
