@@ -12,6 +12,7 @@
 
 #include "Acts/Definitions/Tolerance.hpp"
 #include "Acts/Surfaces/detail/LineHelper.hpp"
+#include "Acts/Surfaces/detail/PlanarHelper.hpp"
 #include "Acts/Utilities/Helpers.hpp"
 
 #include <algorithm>
@@ -63,6 +64,13 @@ CompositeSpacePointLineSeeder::constructTangentLine(const Sp_t& topHit,
                    signTop * topHit.driftRadius() - result.y0) <
          std::numeric_limits<float>::epsilon());
   result.y0 /= cosTheta;
+  if (Acts::abs(eY.z()) > s_epsilon) {
+    using namespace Acts::PlanarHelper;
+    const Vector3 D = makeDirection(bottomHit, result.theta);
+    auto isect = intersectPlane(result.y0 * eY, D, Vector3::UnitZ(), 0.);
+    assert(isect.isValid());
+    result.y0 = isect.position().y();
+  }
   const double denomSquare = 1. - Acts::pow(R / distTubes, 2);
   if (denomSquare < s_epsilon) {
     return result;
