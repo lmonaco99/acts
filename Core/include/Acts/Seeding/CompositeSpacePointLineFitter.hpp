@@ -226,6 +226,15 @@ class CompositeSpacePointLineFitter {
   template <CompositeSpacePointContainer Cont_t,
             CompositeSpacePointCalibrator<Cont_t, Cont_t> Calibrator_t>
   FitResult<Cont_t> fit(FitOptions<Cont_t, Calibrator_t>&& fitOpts) const;
+  /// Jacobian of the slopes (tanBeta, tanAlpha) of a direction (tanAlpha, tanBeta, 1) / norm w.r.t. its angles
+  /// (theta, phi), in the order of the line parameters (bending plane first)
+  /// @param dir: Direction of the line
+  static SquareMatrix<2> slopesJacobian(const Vector_t& dir);
+  /// Jacobian of the line parameters (y0, theta, x0, phi) w.r.t. (y0, tanBeta, x0, tanAlpha): each parameter takes
+  /// the slot of the line parameter it becomes, only the angles mix
+  /// @param dir: Direction of the line
+  /// @return Empty for a direction along z, where phi is not defined
+  static SquareMatrix<4> slopesToLineJacobian(const Vector_t& dir);
 
  private:
   /// Enumeration to classify the parameter update
@@ -267,7 +276,7 @@ class CompositeSpacePointLineFitter {
                                 const std::size_t coord,
                                 const Vector_t& lineDir, CovMat_t& cov);
   /// Covariance of the line parameters from the fast fits in the bending and in the non-bending plane:
-  /// (y0, x0, tanBeta, tanAlpha) -> (y0, theta, x0, phi), theta = atan(|(tanAlpha, tanBeta)|),
+  /// (y0, tanBeta, x0, tanAlpha) -> (y0, theta, x0, phi), theta = atan(|(tanAlpha, tanBeta)|),
   /// phi = atan2(tanBeta, tanAlpha)
   /// @param precResult: Fast fit in the bending plane, in the chamber frame (tanBeta, y0)
   /// @param nonPrecResult: Fast fit in the non-bending plane, in the chamber frame (tanAlpha, x0)
