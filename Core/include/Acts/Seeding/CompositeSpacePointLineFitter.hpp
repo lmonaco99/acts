@@ -226,15 +226,6 @@ class CompositeSpacePointLineFitter {
   template <CompositeSpacePointContainer Cont_t,
             CompositeSpacePointCalibrator<Cont_t, Cont_t> Calibrator_t>
   FitResult<Cont_t> fit(FitOptions<Cont_t, Calibrator_t>&& fitOpts) const;
-  /// Jacobian of the slopes (tanBeta, tanAlpha) of a direction (tanAlpha, tanBeta, 1) / norm w.r.t. its angles
-  /// (theta, phi), in the order of the line parameters (bending plane first)
-  /// @param dir: Direction of the line
-  static SquareMatrix<2> slopesJacobian(const Vector_t& dir);
-  /// Jacobian of the line parameters (y0, theta, x0, phi) w.r.t. (y0, tanBeta, x0, tanAlpha): each parameter takes
-  /// the slot of the line parameter it becomes, only the angles mix
-  /// @param dir: Direction of the line
-  /// @return Empty for a direction along z, where phi is not defined
-  static SquareMatrix<4> slopesToLineJacobian(const Vector_t& dir);
 
  private:
   /// Enumeration to classify the parameter update
@@ -256,28 +247,19 @@ class CompositeSpacePointLineFitter {
   /// @param parValue: Value of the line parameter to check
   /// @param fitPar: Parameter index to which the value corresponds and which interval shall be picked
   bool withinRange(const double parValue, const FitParIndex fitPar) const;
-  /// Converts in place a fast fit done in the (eY, eZ) frame of its reference hit to the chamber frame: the
-  /// angle is replaced by the slope dc/dz of the line and the intercept by its coordinate c at z = 0, with
-  /// their uncertainties and covariance
-  /// @param result: Fast fit result to convert
-  /// @param eY: Measurement axis of the reference hit
-  /// @param eZ: Plane normal of the reference hit
-  /// @param coord: Chamber coordinate measured by the fit (x for the non-bending, y for the bending fit)
-  static void toChamberFrame(FastFitter_t::FitResult& result, const Vector_t& eY,
-                             const Vector_t& eZ, const std::size_t coord);
-  /// Covariance of the line parameters from the fast fit in one plane alone. The parameters of the other
-  /// plane are not fitted and keep their identity rows: in the bending plane theta is the polar angle at
-  /// fixed phi, in the non-bending plane phi is the azimuth at fixed theta.
+  /// Covariance of the line parameters from the fast fit in one plane alone.
+  /// The parameters of the other plane are not fitted and keep their identity
+  /// rows: in the bending plane theta is the polar angle at fixed phi, in the
+  /// non-bending plane phi is the azimuth at fixed theta.
   /// @param planeResult: Fast fit in one plane, in the chamber frame ((tanBeta, y0) or (tanAlpha, x0))
-  /// @param coord: Chamber coordinate measured by the fit (y for the bending, x for the non-bending fit)
+  /// @param projection: Plane of the fit (bending or non-bending)
   /// @param lineDir: Direction of the fitted line
   /// @param cov: Covariance whose (y0, theta) or (x0, phi) block is set
   static void fastFitCovariance(const FastFitter_t::FitResult& planeResult,
-                                const std::size_t coord,
+                                const FastFitter_t::ResidualIdx projection,
                                 const Vector_t& lineDir, CovMat_t& cov);
-  /// Covariance of the line parameters from the fast fits in the bending and in the non-bending plane:
-  /// (y0, tanBeta, x0, tanAlpha) -> (y0, theta, x0, phi), theta = atan(|(tanAlpha, tanBeta)|),
-  /// phi = atan2(tanBeta, tanAlpha)
+  /// Covariance of the line parameters from the fast fits in the bending and in
+  /// the non-bending plane: (y0, x0, tanBeta, tanAlpha) -> (y0, theta, x0, phi)
   /// @param precResult: Fast fit in the bending plane, in the chamber frame (tanBeta, y0)
   /// @param nonPrecResult: Fast fit in the non-bending plane, in the chamber frame (tanAlpha, x0)
   /// @param lineDir: Direction of the fitted line
@@ -326,13 +308,6 @@ class CompositeSpacePointLineFitter {
       const Cont_t& measurements, const Line_t& initialGuess,
       const FastFitDelegate_t<Cont_t, fitTime>& delegate) const;
 
-  /// Executes the fast fit in the non-bending direction. In case of success,
-  /// the
-  ///        fitted angle is overwritten with tanAlpha for an easier combination
-  ///        with the precision fit
-  /// @param measurements: List of measurements to fit
-  template <CompositeSpacePointContainer Cont_t>
-  FastFitResult fastNonPrecFit(const Cont_t& measurements) const;
   /// Update the straight line parameters based on the current chi2 and its
   ///        derivatives. Returns whether the parameter update succeeded or was
   ///        sufficiently small such that the fit is converged. If converged,
