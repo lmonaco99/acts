@@ -12,15 +12,14 @@
 
 #include "Acts/Definitions/Units.hpp"
 #include "Acts/Seeding/detail/CompSpacePointAuxiliaries.hpp"
-#include "Acts/Utilities/Helpers.hpp"
 #include "Acts/Utilities/VectorHelpers.hpp"
 #include "Acts/Utilities/detail/periodic.hpp"
 
 namespace Acts::Experimental::detail {
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::GlobalPatternFinder(
+GlobalPatternFinder<Hit_t, Sector_t, nGroups>::GlobalPatternFinder(
     Config&& config, std::unique_ptr<const Logger> outputLogger)
     : m_cfg{std::move(config)}, m_logger{std::move(outputLogger)} {
   static_assert(std::is_move_assignable_v<PatternStateAux>);
@@ -30,54 +29,37 @@ GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::GlobalPatternFinder(
   static_assert(std::is_nothrow_move_constructible_v<PatternStateAux>);
   static_assert(std::is_nothrow_move_assignable_v<PatternStateAux>);
   
-  if (m_cfg.groupOrder.connected()) {
-    for (std::uint8_t a = 0u; a < nGroups; ++a) {
-      for (std::uint8_t b = 0u; b < nGroups; ++b) {
-        /// Hits of the same group are ordered by layer index or by geometry
-        if (a == b) {
-          continue;
-        }
-        const std::partial_ordering ab{m_cfg.groupOrder(a, b)};
-        const std::partial_ordering ba{m_cfg.groupOrder(b, a)};
-        /// Either both unordered, or opposite
-        const bool valid{(std::is_lt(ab) && std::is_gt(ba)) ||
-                         (std::is_gt(ab) && std::is_lt(ba)) ||
-                         (ab == std::partial_ordering::unordered &&
-                          ba == std::partial_ordering::unordered)};
-        if (!valid) {
-          throw std::invalid_argument(
-              std::format("groupOrder is not antisymmetric for groups {} and {}",
-                          static_cast<int>(a), static_cast<int>(b)));
-        }
-        if (ab != std::partial_ordering::unordered) {
-          m_groupOrder[a][b] = std::is_lt(ab);
-        }
-      }
-    }
+  if (!m_cfg.layerOrder.connected()) {
+    throw std::invalid_argument("layerOrder must be connected");
+  }
+  if (!m_cfg.groupIndex.connected() || !m_cfg.isPrecision.connected()) {
+    throw std::invalid_argument("groupIndex and isPrecision must be connected");
+  }
+  if (!m_cfg.goodForSeeding.connected()) {
+    throw std::invalid_argument("goodForSeeding must be connected");
+  }
+  if (!m_cfg.thetaSearchWindow.connected()) {
+    throw std::invalid_argument("thetaSearchWindow must be connected");
   }
   if (!m_cfg.hitOverlap.connected()) {
     ACTS_INFO(__func__ << "() hit overlap delegate is not connected, "
                   "using default implementation");
     m_cfg.hitOverlap.template connect<&defaultHitOverlap>();
   }
-  if (m_cfg.attachPhiOnlyHits && !m_cfg.phiOnlyLayerIdx.connected()) {
-    throw std::invalid_argument(
-        "phiOnlyLayerIdx must be connected when attachPhiOnlyHits is set");
-  }
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-template <PatternSeedSelector<Bucket_t, nGroups> SeedSelector_t>
-std::vector<
-    typename GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::OutputPattern>
-GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::findPatterns(
-    const SearchTree_t& treeData,
-    const SeedSelector_t& seedSelector,
-    const BeamspotInfo& beamspotInfo) const {
-  PatternStateAuxVec patterns{
-      findPatternsInEta(treeData, seedSelector, beamspotInfo)};
-  if (m_cfg.attachPhiOnlyHits) {
+auto GlobalPatternFinder<Hit_t, Sector_t, nGroups>::findPatterns(
+    SearchEntries_t searchEntries,
+    const BeamspotInfo& beamspotInfo) const -> std::vector<OutputPattern> {
+  /// Sort the entries by sector and theta: the candidates of a seed are a
+  /// contiguous range
+  std::ranges::stable_sort(searchEntries, std::less{}, [](const SearchEntry& e) {
+    return std::make_pair(e.sector, e.theta);
+  });
+  PatternStateAuxVec patterns{findPatternsInEta(searchEntries, beamspotInfo)};
+  if (m_cfg.phiOnlyHits.connected()) {
     /// Remove the patterns that do not have enough phi layers and add phi-only
     /// hits to the others
     addPhiOnlyHits(beamspotInfo, patterns);
@@ -91,16 +73,13 @@ GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::findPatterns(
   return convertToPattern(std::move(patterns));
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-template <PatternSeedSelector<Bucket_t, nGroups> SeedSelector_t>
-GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::PatternStateAuxVec
-GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::findPatternsInEta(
-    const SearchTree_t& orderedSpacepoints,
-    const SeedSelector_t& seedSelector,
-    const BeamspotInfo& beamspotInfo) const {
-  constexpr auto thetaIdx{Acts::toUnderlying(HitCoords::eTheta)};
-  constexpr auto sectorIdx{Acts::toUnderlying(HitCoords::eSector)};
+auto GlobalPatternFinder<Hit_t, Sector_t, nGroups>::findPatternsInEta(
+    const SearchEntries_t& searchEntries,
+    const BeamspotInfo& beamspotInfo) const -> PatternStateAuxVec {
+  /// Sector and theta of an entry, the sort key of the search entries
+  auto entryKey = [](const SearchEntry& e) { return std::make_pair(e.sector, e.theta); };
 
   /// Define candidate hit buffer
   std::vector<OrderedHit> orderedHits{};
@@ -114,51 +93,51 @@ GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::findPatternsInEta(
   PatternStateAuxVec outPatterns{};
   outPatterns.reserve(10);
 
-  /// We try to build a pattern in eta starting from every hit in the tree
-  for (const auto& [seedCoords, seedPtr] : orderedSpacepoints) {
+  /// We try to build a pattern in eta starting from every search entry
+  for (const SearchEntry& seedEntry : searchEntries) {
     /// Get the seed hit
+    const Hit_t* seedPtr{seedEntry.hit};
     const Hit_t& seed{*seedPtr};
-    if (!seedSelector.goodForSeeding(seed)) {
+    if (!m_cfg.goodForSeeding(seed)) {
       continue;
     }
     ACTS_VERBOSE(__func__ << "() New seed hit "
-                          << Acts::toString(seed.spacePoint())
-                          << " , coordinates [" << seedCoords[sectorIdx] << ", "
-                          << seedCoords[thetaIdx] << "]");
+                          << Acts::toString(seed)
+                          << " , coordinates [" << static_cast<int>(seedEntry.sector) << ", "
+                          << seedEntry.theta << "]");
 
     /// Check how many existing patterns contain this hit
-    if (countPatterns(outPatterns, seed, seedCoords) >= m_cfg.maxSeedAttempts) {
+    if (countPatterns(outPatterns, seed, seedEntry) >= m_cfg.maxSeedAttempts) {
       ACTS_VERBOSE(__func__
                    << "() Seed has already been used in "
                    << static_cast<int>(
-                          countPatterns(outPatterns, seed, seedCoords))
+                          countPatterns(outPatterns, seed, seedEntry))
                    << " patterns, which is above the limit - skip this seed.");
       continue;
     }
     /// Define the search range.
-    const auto& windowPerGroup{seedSelector.thetaSearchWindow(seed)};
+    const auto& windowPerGroup{m_cfg.thetaSearchWindow(seed)};
     const double thetaHalfWindow{std::ranges::max(windowPerGroup)};
 
-    typename SearchTree_t::range_t selectRange{};
-    /// The sector coordinate is an integer index: +-0.1 selects only the seed
-    /// sector
-    selectRange[sectorIdx].shrink(seedCoords[sectorIdx] - 0.1,
-                                  seedCoords[sectorIdx] + 0.1);
-    selectRange[thetaIdx].shrink(seedCoords[thetaIdx] - thetaHalfWindow,
-                                 seedCoords[thetaIdx] + thetaHalfWindow);
+    /// The entries of the seed sector with theta in [theta - window, theta + window)
+    const auto first{std::ranges::lower_bound(
+        searchEntries, std::make_pair(seedEntry.sector, seedEntry.theta - thetaHalfWindow),
+        std::less{}, entryKey)};
+    const auto last{std::ranges::lower_bound(
+        first, searchEntries.end(),
+        std::make_pair(seedEntry.sector, seedEntry.theta + thetaHalfWindow),
+        std::less{}, entryKey)};
 
     /// Search for compatible spacepoints with the seed and check if there are
     /// enough to build a pattern
     orderedHits.clear();
-    orderedSpacepoints.rangeSearchMapDiscard(
-        selectRange,
-        [&](const SearchTree_t::coordinate_t& coords, const Hit_t* hit) {
-          if (Acts::abs(coords[thetaIdx] - seedCoords[thetaIdx]) >
-              windowPerGroup[hit->groupIdx()]) {
-            return;  // skip hits outside the theta search window
-          }
-          orderedHits.emplace_back(hit, 0u);
-        });
+    for (const SearchEntry& entry : std::ranges::subrange(first, last)) {
+      const std::uint8_t group{m_cfg.groupIndex(*entry.hit)};
+      if (Acts::abs(entry.theta - seedEntry.theta) > windowPerGroup[group]) {
+        continue;  // skip hits outside the theta search window
+      }
+      orderedHits.emplace_back(entry.hit, 0u, group, m_cfg.isPrecision(*entry.hit));
+    }
     if (orderedHits.size() <
         m_cfg.minStripEtaLayers + m_cfg.minPrecisionLayers) {
       ACTS_VERBOSE(__func__
@@ -171,7 +150,7 @@ GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::findPatternsInEta(
     std::array<std::uint8_t, nGroups> groupCounts{};
     std::uint8_t nValidGroups{0u};
     for (const OrderedHit& c : orderedHits) {
-      if (++groupCounts[c->groupIdx()] == m_cfg.minGroupLayers) {
+      if (++groupCounts[c.groupIdx] == m_cfg.minGroupLayers) {
         ++nValidGroups;
       }
       if (nValidGroups >= m_cfg.minGroups) {
@@ -185,24 +164,16 @@ GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::findPatternsInEta(
                    << " groups, below the minimum required - skip seed.");
       continue;
     }
-    /// Sort the compatible spacepoints by global logical layer and, if they
-    /// are on the same layer, by their position along the bending coordinate
-    std::ranges::sort(orderedHits, [&](const OrderedHit& c1,
-                                       const OrderedHit& c2) {
-      const std::weak_ordering layerOrder{compareLayers(*c1, *c2)};
-      if (std::is_eq(layerOrder)) {
-        /// Only meaningful for hits in the same local frame. Equivalent hits in
-        /// different frames are at the same depth, where any order is fine.
-        return c1->spacePoint().localPosition().y() <
-               c2->spacePoint().localPosition().y();
-      }
-      return std::is_lt(layerOrder);
+    /// Sort the compatible spacepoints by global logical layer. The sort is
+    /// stable: the hits on the same layer keep the order of the search tree
+    std::ranges::stable_sort(orderedHits, [&](const OrderedHit& c1,
+                                              const OrderedHit& c2) {
+      return std::is_lt(m_cfg.layerOrder(*c1, *c2));
     });
-    /// Assign global layer number. This will avoid re-computing it many times
-    /// later
+    /// Assign global layer number.
     for (std::size_t i = 1; i < orderedHits.size(); ++i) {
       orderedHits[i].globLayer = orderedHits[i - 1].globLayer +
-                                 std::is_neq(compareLayers(
+                                 std::is_neq(m_cfg.layerOrder(
                                      *orderedHits[i - 1], *orderedHits[i]));
     }
     if (orderedHits.back().globLayer + 1u <
@@ -232,7 +203,7 @@ GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::findPatternsInEta(
     /// of m_cfg
     PatternStateAux patternSeed{
         seedCand,
-        static_cast<typename Sector_t::Index_t>(seedCoords[sectorIdx]), m_cfg,
+        seedEntry.sector, m_cfg,
         logger()};
 
     /// @brief Helper function to extend a given pattern with a set of hits. We can have pattern
@@ -327,9 +298,9 @@ GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::findPatternsInEta(
   return outPatterns;
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-void GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::extendPatterns(
+void GlobalPatternFinder<Hit_t, Sector_t, nGroups>::extendPatterns(
     PatternStateAuxVec& startPatterns,
     PatternStateAuxVec& endPatterns, const OrderedHit& testHit,
     const BeamspotInfo& beamSpot) const {
@@ -361,8 +332,8 @@ void GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::extendPatterns(
     }
     /// Check the pattern has not already missed too many layers compared to
     /// other patterns.
-    if (pat.lastInsertedHit->groupIdx() ==
-            testHit->groupIdx() &&
+    if (pat.lastInsertedHit.groupIdx ==
+            testHit.groupIdx &&
         missedLayers(pat) >
             std::max(m_cfg.maxMissLayersInGroup, minMissedLayers)) {
       ACTS_VERBOSE(__func__
@@ -489,19 +460,18 @@ void GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::extendPatterns(
   }
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::LineTestResult_t
-GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::checkLineCompatibility(
+auto GlobalPatternFinder<Hit_t, Sector_t, nGroups>::checkLineCompatibility(
     PatternStateAux& pat,
-    const OrderedHit& testHit, const BeamspotInfo& beamSpot) const {
+    const OrderedHit& testHit, const BeamspotInfo& beamSpot) const -> LineTestResult_t {
   const bool searchInNewLayer{testHit.globLayer !=
                               pat.lastInsertedHit.globLayer};
   if (searchInNewLayer) {
     pat.syncState(beamSpot);
   }
-  if (testHit->spacePoint().measuresLoc0() &&
-      !isPhiCompatible(pat, testHit->globalPosition())) {
+  if (testHit->measuresLoc0() &&
+      !isPhiCompatible(pat, testHit->localPosition())) {
     return std::make_pair(LineTestDecision::eRejectHit, LineTestRes{});
   }
 
@@ -515,11 +485,11 @@ GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::checkLineCompatibility(
     /// Loosen the window when we use the beamspot or when we are looking for
     /// hits in a new group, as the straight line approximation becomes less
     /// accurate on large distances. TO DO: investigate this further
-    const auto testHitGroup{testHit->groupIdx()};
+    const auto testHitGroup{testHit.groupIdx};
     const bool searchInNewGroup{testHitGroup !=
-                                pat.lastInsertedHit->groupIdx()};
+                                pat.lastInsertedHit.groupIdx};
     if (pat.useBeamspot || searchInNewGroup ||
-        (testHitGroup != pat.prevLayerHit->groupIdx() &&
+        (testHitGroup != pat.prevLayerHit.groupIdx &&
          !searchInNewLayer)) {
       accWindow *= m_cfg.loosenAcceptanceFactor;
     }
@@ -546,8 +516,8 @@ GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::checkLineCompatibility(
   /// Same layer, one precision and one non-precision hit: decide whether they
   /// are the same crossing (keep only the precision hit) or whether both
   /// hypotheses must be kept (branch).
-  const bool testPrec{testHit->isPrecision()};
-  const bool lastPrec{pat.lastInsertedHit->isPrecision()};
+  const bool testPrec{testHit.isPrecision};
+  const bool lastPrec{pat.lastInsertedHit.isPrecision};
   if (testPrec != lastPrec) {
     ACTS_VERBOSE(__func__ << "() Test hit on same layer as last inserted hit "
                              "with different precision - check compatibility.");
@@ -584,9 +554,9 @@ GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::checkLineCompatibility(
   return makeResult(LineTestDecision::eBranchPattern);
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::isPhiCompatible(
+bool GlobalPatternFinder<Hit_t, Sector_t, nGroups>::isPhiCompatible(
     const PatternStateAux& pat, const Vector3& pos) const {
   /// We check that the test hit is compatible with the pattern phi, if
   /// available. If not, we check that the test hit is in the same pattern
@@ -613,9 +583,9 @@ bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::isPhiCompatible(
   return true;
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::passPatternCuts(
+bool GlobalPatternFinder<Hit_t, Sector_t, nGroups>::passPatternCuts(
     const PatternStateAux& pat) const {
   /// Check that the pattern meets the minimum requirements for trigger and
   /// precision layers
@@ -642,9 +612,9 @@ bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::passPatternCuts(
   return true;
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::passPhiLayerCut(
+bool GlobalPatternFinder<Hit_t, Sector_t, nGroups>::passPhiLayerCut(
     const PatternStateAux& pat) const {
   if (pat.nPhiLayers < m_cfg.minPhiLayers) {
     ACTS_VERBOSE(
@@ -657,9 +627,9 @@ bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::passPhiLayerCut(
   return true;
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::insertIfBest(
+bool GlobalPatternFinder<Hit_t, Sector_t, nGroups>::insertIfBest(
     PatternStateAuxVec& patterns, PatternStateAux&& cand) const {
   std::vector<std::size_t> losers{};
   for (const auto& [otherIdx, other] : Acts::enumerate(patterns)) {
@@ -687,9 +657,9 @@ bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::insertIfBest(
   return true;
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::areOverlapping(
+bool GlobalPatternFinder<Hit_t, Sector_t, nGroups>::areOverlapping(
     const PatternStateAux& a, const PatternStateAux& b) const {
   /// Check first the geometrical overlap
   if (!a.sector.isNeighbour(b.sector)) {
@@ -702,7 +672,7 @@ bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::areOverlapping(
   /// Common reference radius: where the patterns actually live, e.g. the anchor
   /// hit of either one.
   const double refR{
-      a.lineAnchorHit->globalPosition().template head<2>().norm()};
+      a.lineAnchorHit->localPosition().template head<2>().norm()};
   if (a.nPhiLayers > 1 && b.nPhiLayers > 1) {
     if (Acts::abs(Acts::detail::difference_periodic(
             a.phiAtRadius(refR), b.phiAtRadius(refR), 2. * std::numbers::pi)) >
@@ -748,9 +718,9 @@ bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::areOverlapping(
          nSharedGroups >= std::min<std::size_t>(m_cfg.minGroups, nCommonGroups);
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::isBetterOverlap(
+bool GlobalPatternFinder<Hit_t, Sector_t, nGroups>::isBetterOverlap(
     const PatternStateAux& a, const PatternStateAux& b) const {
   if (a.isOverlap != b.isOverlap) {
     return b.isOverlap;
@@ -779,9 +749,9 @@ bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::isBetterOverlap(
   return nLayerDiff > 0;
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::isBetterBranch(
+bool GlobalPatternFinder<Hit_t, Sector_t, nGroups>::isBetterBranch(
     const PatternStateAux& a, const PatternStateAux& b) {
   if (a.isOverlap != b.isOverlap) {
     return b.isOverlap;
@@ -795,87 +765,40 @@ bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::isBetterBranch(
   return a.getMeanResidual2() < b.getMeanResidual2();
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-std::weak_ordering GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::compareLayers(
-    const Hit_t& a, const Hit_t& b) const {
-  /// Check if two hits are in the same local frame.
-  if (std::addressof(a.localToGlobal()) == std::addressof(b.localToGlobal())) {
-    return a.layerIdx() <=> b.layerIdx();
-  }
-  /// Different groups with a fixed order
-  const std::optional<bool>& aBeforeB{
-      m_groupOrder[a.groupIdx()][b.groupIdx()]};
-  if (aBeforeB.has_value()) {
-    return *aBeforeB ? std::weak_ordering::less : std::weak_ordering::greater;
-  }
-  /// Same group in different local frames (e.g. sector overlaps) or groups
-  /// without a fixed order: compare the depth along the outward direction of
-  /// the two frames (the local z-axis points outwards, see CompositeSpacePoint)
-  const Vector3 outward{a.localToGlobal().linear().col(2) +
-                        b.localToGlobal().linear().col(2)};
-  const double delta{(a.globalPosition() - b.globalPosition()).dot(outward)};
-  /// Hits closer than this along the outward direction are on the same layer:
-  /// well above the rounding of the global positions, well below any layer
-  /// spacing (so the equivalence is transitive in practice).
-  constexpr double layerTolerance{1. * UnitConstants::um};
-  if (Acts::abs(delta) <= layerTolerance) {
-    return std::weak_ordering::equivalent;
-  }
-  return delta < 0. ? std::weak_ordering::less : std::weak_ordering::greater;
-}
-
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
-          std::uint8_t nGroups>
-bool GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::defaultHitOverlap(
+bool GlobalPatternFinder<Hit_t, Sector_t, nGroups>::defaultHitOverlap(
     const Hit_t& a, const Hit_t& b) {
-  const SpacePoint_t& spA{a.spacePoint()};
-  const SpacePoint_t& spB{b.spacePoint()};
-  if (std::addressof(spA) == std::addressof(spB)) {
-    return true;
-  }
-  /// Local coordinates are only comparable within the same local frame
-  if (std::addressof(a.localToGlobal()) != std::addressof(b.localToGlobal()) ||
-      a.layerIdx() != b.layerIdx()) {
-    return false;
-  }
-  using ResidualIdx = CompSpacePointAuxiliaries::ResidualIdx;
-  const double dLocY{Acts::abs(spA.localPosition().y() - spB.localPosition().y())};
-  const double dSigY{std::sqrt(spA.covariance()[toUnderlying(ResidualIdx::bending)] +
-                               spB.covariance()[toUnderlying(ResidualIdx::bending)])};
-  return dLocY < dSigY;
+  return std::addressof(a) == std::addressof(b);
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-unsigned GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::countPatterns(
+unsigned GlobalPatternFinder<Hit_t, Sector_t, nGroups>::countPatterns(
     const PatternStateAuxVec& patterns, const Hit_t& seed,
-    const SearchTree_t::coordinate_t& seedCoords) const {
-  constexpr auto thetaIdx{Acts::toUnderlying(HitCoords::eTheta)};
-  constexpr auto sectorIdx{Acts::toUnderlying(HitCoords::eSector)};
+    const SearchEntry& seedEntry) const {
   return std::ranges::count_if(patterns, [&](const PatternStateAux& pattern) {
-    if (Acts::abs(pattern.patTheta - seedCoords[thetaIdx]) >
+    if (Acts::abs(pattern.patTheta - seedEntry.theta) >
             m_cfg.maxThetaSizeOverlap ||
-        !pattern.sector.isNeighbour(Sector_t{
-            static_cast<typename Sector_t::Index_t>(seedCoords[sectorIdx])})) {
+        !pattern.sector.isNeighbour(Sector_t{seedEntry.sector})) {
       return false;
     }
-    return pattern.isInPattern(seed);
+    return pattern.isInPattern(seed, m_cfg.groupIndex(seed));
   });
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-std::uint8_t GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::countGoodGroups(
+std::uint8_t GlobalPatternFinder<Hit_t, Sector_t, nGroups>::countGoodGroups(
     const PatternStateAux& pat) const {
   return std::ranges::count_if(pat.hitsPerGroup, [this](const auto& hits) {
     return hits.size() >= m_cfg.minGroupLayers;
   });
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-void GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::addPhiOnlyHits(
+void GlobalPatternFinder<Hit_t, Sector_t, nGroups>::addPhiOnlyHits(
     const BeamspotInfo& beamspotInfo,
     PatternStateAuxVec& patterns) const {
   using namespace Acts::UnitLiterals;
@@ -891,7 +814,7 @@ void GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::addPhiOnlyHits(
     if (!passPhiLayerCut(pat)) {
       continue;
     }
-    /// We look for phi-only hits in the parent buckets of the pattern hits
+    /// We look for phi-only hits in the regions of the pattern hits
     ACTS_VERBOSE(__func__ << "() Search for phi-only hits for pattern: "
                           << PatternStateAux::brief(pat));
 
@@ -908,24 +831,31 @@ void GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::addPhiOnlyHits(
       return Acts::abs(res.residual) / res.sigma;
     };
 
-    for (const auto& [group, refs] : Acts::enumerate(pat.bucketRefs())) {
-      for (const OrderedHit* refPtr : refs) {
-        const OrderedHit& refHit{*refPtr};
-        for (const auto& spPtr : refHit->parentBucket()) {
-          /// Phi-only space points do not measure the bending coordinate
-          if (spPtr->measuresLoc1()) {
+    /// Regions already searched, identified by the data pointer of their phi-only hits
+    std::vector<const Hit_t*> searchedRegions{};
+    for (const auto& [group, groupHits] : Acts::enumerate(pat.hitsPerGroup)) {
+      for (const OrderedHit& refHit : groupHits) {
+        /// The first pattern hit of each region is the reference hit
+        const std::span<const Hit_t> regionHits{m_cfg.phiOnlyHits(*refHit)};
+        if (regionHits.empty() ||
+            std::ranges::find(searchedRegions, regionHits.data()) != searchedRegions.end()) {
+          continue;
+        }
+        searchedRegions.push_back(regionHits.data());
+        for (const Hit_t& phiHit : regionHits) {
+          /// Phi-only hits do not measure the bending coordinate
+          if (phiHit.measuresLoc1()) {
             continue;
           }
-          Hit_t newHit{*spPtr, refHit->parentBucket(), refHit->localToGlobal(), static_cast<std::uint8_t>(group), m_cfg.phiOnlyLayerIdx(*spPtr), false};
+          const Hit_t& newHit{phiHit};
           ACTS_VERBOSE(__func__ << "() *** Test phi-only hit "
-                                << Acts::toString(newHit.spacePoint())
+                                << Acts::toString(newHit)
                                 << " in group " << static_cast<int>(group));
 
           /// Reject hits on a layer where an eta hit already measures phi
-          const auto& groupHits{pat.hitsPerGroup[group]};
           if (std::ranges::any_of(groupHits, [&](const OrderedHit& h) {
-                return h->spacePoint().measuresLoc0() &&
-                      std::is_eq(compareLayers(*h, newHit));
+                return h->measuresLoc0() &&
+                      std::is_eq(m_cfg.layerOrder(*h, newHit));
               })) {
             ACTS_VERBOSE(__func__ << "() Found eta hit measuring also phi on "
                                     "same layer - skip hit.");
@@ -938,7 +868,7 @@ void GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::addPhiOnlyHits(
                                     << group << " - skip hit.");
               continue;
             }
-            patternLineGroup = newHit.groupIdx();
+            patternLineGroup = static_cast<std::uint8_t>(group);
           }
           const auto [crossPos, distOutsideStrip] =
               pat.phiStripCrossing(newHit);
@@ -965,7 +895,7 @@ void GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::addPhiOnlyHits(
           if (const auto it = std::ranges::find_if(
                   candidates,
                   [&](const auto& cand) {
-                    return std::is_eq(compareLayers(cand.first.hit, newHit));
+                    return std::is_eq(m_cfg.layerOrder(*cand.first.hit, newHit));
                   });
               it != candidates.end()) {
             if (it->second < pull) {
@@ -973,9 +903,9 @@ void GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::addPhiOnlyHits(
                                       "same layer - skip hit.");
               continue;
             }
-            *it = {{std::move(newHit), crossPos}, pull};
+            *it = {{&newHit, crossPos}, pull};
           } else {
-            candidates.push_back({{std::move(newHit), crossPos}, pull});
+            candidates.push_back({{&newHit, crossPos}, pull});
           }
         }
         /// Add the candidates to the pattern one at a time, the most compatible
@@ -986,8 +916,8 @@ void GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::addPhiOnlyHits(
                           [](const auto& cand) { return cand.second; });
         for (auto& [cand, _] : candidates) {
           const auto [crossPos, distOutsideStrip] =
-              pat.phiStripCrossing(cand.hit);
-          const double newPull{phiPull(cand.hit, crossPos)};
+              pat.phiStripCrossing(*cand.hit);
+          const double newPull{phiPull(*cand.hit, crossPos)};
           if (distOutsideStrip > margin || newPull > m_cfg.nResidualSigma) {
             ACTS_VERBOSE(__func__ << "() Phi-only hit with pull " << newPull
                                   << " and distance outside the strip "
@@ -998,15 +928,15 @@ void GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::addPhiOnlyHits(
           if (const auto it = std::ranges::find_if(
                   pat.phiOnlyHits,
                   [&](const typename PatternStateAux::PhiOnlyHit& h) {
-                    return std::is_eq(compareLayers(h.hit, cand.hit));
+                    return std::is_eq(m_cfg.layerOrder(*h.hit, *cand.hit));
                   });
               it != pat.phiOnlyHits.end()) {
-            if (phiPull(it->hit, it->crossPos) < newPull) {
+            if (phiPull(*it->hit, it->crossPos) < newPull) {
               continue;
             }
-            *it = {std::move(cand.hit), crossPos};
+            *it = {cand.hit, crossPos};
           } else {
-            pat.phiOnlyHits.push_back({std::move(cand.hit), crossPos});
+            pat.phiOnlyHits.push_back({cand.hit, crossPos});
           }
           pat.updateBendPlane(beamspotInfo);
           /// The line hits are projected again onto the updated bending plane.
@@ -1030,11 +960,10 @@ void GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::addPhiOnlyHits(
 }
 
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-typename GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::OutputPattern
-GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::convertToPattern(
-    PatternStateAux&& candidate) const {
+auto GlobalPatternFinder<Hit_t, Sector_t, nGroups>::convertToPattern(
+    PatternStateAux&& candidate) const -> OutputPattern {
   OutputPattern output{
       static_cast<typename Sector_t::Index_t>(candidate.sector.sector())};
   for (std::uint8_t g = 0u; g < nGroups; ++g) {
@@ -1043,21 +972,9 @@ GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::convertToPattern(
                            std::back_inserter(output.hitsPerGroup[g]),
                            [](const OrderedHit& hit) { return hit.hitPtr; });
   }
-  output.phiOnlyHits.reserve(candidate.phiOnlyHits.size());
-  std::ranges::transform(candidate.phiOnlyHits,
-                         std::back_inserter(output.phiOnlyHits),
-                         [](typename PatternStateAux::PhiOnlyHit& phiHit) {
-                           return std::move(phiHit.hit);
-                         });
-  /// The phi-only hits come from the same buckets as the pattern hits
-  for (const auto& refsPerGroup : candidate.bucketRefs()) {
-    for (const OrderedHit* ref : refsPerGroup) {
-      const Bucket_t* bucket{std::addressof((*ref)->parentBucket())};
-      if (std::ranges::find(output.parentBuckets, bucket) ==
-          output.parentBuckets.end()) {
-        output.parentBuckets.push_back(bucket);
-      }
-    }
+  /// The phi-only hits after the eta hits of their group
+  for (const typename PatternStateAux::PhiOnlyHit& phiHit : candidate.phiOnlyHits) {
+    output.hitsPerGroup[m_cfg.groupIndex(*phiHit.hit)].push_back(phiHit.hit);
   }
   output.meanNormResidual2 = candidate.getMeanResidual2();
   output.patTheta = candidate.patTheta;
@@ -1071,12 +988,10 @@ GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::convertToPattern(
   return output;
 }
 
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
-std::vector<
-    typename GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::OutputPattern>
-GlobalPatternFinder<Bucket_t, Sector_t, nGroups>::convertToPattern(
-    PatternStateAuxVec&& candidates) const {
+auto GlobalPatternFinder<Hit_t, Sector_t, nGroups>::convertToPattern(
+    PatternStateAuxVec&& candidates) const -> std::vector<OutputPattern> {
   std::vector<OutputPattern> outPatterns{};
   outPatterns.reserve(candidates.size());
 

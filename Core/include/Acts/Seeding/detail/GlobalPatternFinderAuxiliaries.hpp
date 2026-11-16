@@ -29,87 +29,6 @@
 
 namespace Acts::Experimental::detail {
 
-/// @brief Hit used by the Global Pattern Finder: a space point together with 
-///  the information needed by the pattern finder. Space-points are generally 
-///  grouped into buckets, which satisfy the @ref CompositeSpacePointContainer
-///  concept. All the space points of a bucket are expressed in the same local
-///  frame, defined by a common local-to-global transform.
-///  The global position is cached at construction time, while the global 
-///  sensor/strip directions are computed on the fly from the local-to-global
-///  transform.
-/* 
-template <Sp_t>
-class GlobPatFinderHit: public Sp_t {
- public:
- */
-template <CompositeSpacePointContainer Bucket_t>
-class GlobPatFinderHit {
- public:
- 
-  /// @brief Type of the underlying space point
-  using SpacePoint_t = RemovePointer_t<typename Bucket_t::value_type>;
-  /// @brief Constructor given the transform defining the local frame of the bucket
-  ///  @param sp: underlying space point
-  ///  @param bucket: bucket holding the space point
-  ///  @param localToGlobal: transform from the local frame of the bucket to the
-  ///         global frame. Only its address is stored, so it must outlive the
-  ///         hit. Hits in the same local frame must share the same instance.
-  ///  @param groupIdx: group index of the hit in the pattern topology
-  ///  @param layerIdx: layer index of the hit in the local frame, increasing
-  ///         along the local z-axis (i.e. outwards)
-  ///  @param isPrecision: whether the hit is a precision measurement
-  GlobPatFinderHit(const SpacePoint_t& sp, const Bucket_t& bucket,
-                   const Transform3& localToGlobal,
-                   const std::uint8_t groupIdx, const std::uint8_t layerIdx,
-                   const bool isPrecision)
-      : m_position{localToGlobal * sp.localPosition()},
-        m_sp{std::addressof(sp)},
-        m_bucket{std::addressof(bucket)},
-        m_localToGlobal{std::addressof(localToGlobal)},
-        m_sensorDir{localToGlobal.linear() * sp.sensorDirection()},
-        m_toNextDir{localToGlobal.linear() * sp.toNextSensor()},
-        m_groupIdx{groupIdx},
-        m_layerIdx{layerIdx},
-        m_precision{isPrecision} {}
-  /// @brief Return the underlying space point
-  const SpacePoint_t& spacePoint() const { return *m_sp; }
-  /// @brief Return the transform associated with the local frame of the bucket
-  const Transform3& localToGlobal() const { return *m_localToGlobal; }
-  /// @brief Return the global position of the space point
-  const Vector3& globalPosition() const { return m_position; }
-  /// @brief Return the sensor direction in the global frame
-  const Vector3& globalSensorDirection() const { return m_sensorDir; }
-  /// @brief Return the unit vector pointing to the next sensor in the global frame
-  const Vector3& globalToNextSensor() const { return m_toNextDir; }
-  /// @brief Return the parent bucket of the space point
-  const Bucket_t& parentBucket() const { return *m_bucket; }
-  /// @brief Return the group index of the hit
-  std::uint8_t groupIdx() const { return m_groupIdx; }
-  /// @brief Return the layer index of the hit in the local frame. It increases
-  ///        along the local z-axis (outwards), consistently with the geometric
-  ///        ordering of hits in different local frames.
-  std::uint8_t layerIdx() const { return m_layerIdx; }
-  /// @brief Return whether the hit is a precision measurement
-  bool isPrecision() const { return m_precision; }
-
- private:
-  /// @brief Global position of the space point
-  Vector3 m_position{Vector3::Zero()};
-  /// @brief Pointer to the underlying space point
-  const SpacePoint_t* m_sp{nullptr};
-  /// @brief Pointer to the bucket holding the space point
-  const Bucket_t* m_bucket{nullptr};
-  /// @brief Pointer to the transform from local to global coordinates
-  const Transform3* m_localToGlobal{nullptr};
-  Vector3 m_sensorDir{Vector3::Zero()};
-  Vector3 m_toNextDir{Vector3::Zero()};
-  /// @brief Group index in the pattern topology
-  std::uint8_t m_groupIdx{0u};
-  /// @brief Layer index in the local frame
-  std::uint8_t m_layerIdx{0u};
-  /// @brief Precision flag
-  bool m_precision{false};
-};
 /// @brief Sectorization of the detector in the non-bending coordinate.
 ///  In this first implementation of Global Pattern Finder with toroidal
 ///  azimuthal field, the sectors are defined along the phi direction.
@@ -133,11 +52,9 @@ concept SectorType =
       { sector.insideSector(phi) } -> std::same_as<bool>;
     };
 /// @brief Pattern state object storing pattern information during construction
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
 struct PatternStateAux {
-  /// @brief Hit type used by the pattern
-  using Hit_t = GlobPatFinderHit<Bucket_t>;
   /// @brief Configuration object of the residual calculator
   struct Config {
     /// @brief Minimum distance between two hits for being used to
@@ -171,6 +88,10 @@ struct PatternStateAux {
     const Hit_t* hitPtr{nullptr};
     /// @brief Global measurement layer number
     std::uint8_t globLayer{0u};
+    /// @brief Group index of the hit in the pattern topology (Config::groupIndex)
+    std::uint8_t groupIdx{0u};
+    /// @brief Whether the hit is a precision measurement (Config::isPrecision)
+    bool isPrecision{false};
     /// @brief Access to the underlying hit methods
     const Hit_t* operator->() const { return hitPtr; }
     /// @brief Access to the underlying hit
@@ -188,17 +109,13 @@ struct PatternStateAux {
     /// @brief Print the OrderedHit information to a stream
     void print(std::ostream& ostr) const;
   };
-  /// @brief We will need to retrieve the parent buckets and their associated
-  ///        transforms for each group. We can then store a representative hit per bucket
-  using BucketRefs_t =
-    std::array<std::vector<const OrderedHit*>, nGroups>;
   /// @brief Phi-only hit attached to the pattern, together with the point on
   ///        the strip crossed by the pattern line. The strip position is in
   ///        general not the crossing point (e.g. the strip centre), so the
   ///        crossing point is used for the phi of the hit.
   struct PhiOnlyHit {
-    /// @brief The phi-only hit
-    Hit_t hit;
+    /// @brief The phi-only hit, owned by the user
+    const Hit_t* hit{nullptr};
     /// @brief Point on the strip crossed by the pattern line
     Vector3 crossPos{Vector3::Zero()};
   };
@@ -335,12 +252,9 @@ struct PatternStateAux {
   /// ************ Pattern information getters ************
   /// @brief Check whether a hit is present in the pattern
   ///  @param hit: hit to be checked
+  ///  @param group: group index of the hit
   ///  @return: true if the hit is in the pattern
-  bool isInPattern(const Hit_t& hit) const;
-  /// @brief Collect the distinct parent buckets of the pattern hits, per group.
-  ///  One pattern hit per distinct bucket is used as reference.
-  ///  @return: reference hits of the distinct parent buckets, per group
-  BucketRefs_t bucketRefs() const;
+  bool isInPattern(const Hit_t& hit, std::uint8_t group) const;
   /// @brief Method returning the number of groups
   ///  @return: number of groups in the pattern
   std::uint8_t countGroups() const;

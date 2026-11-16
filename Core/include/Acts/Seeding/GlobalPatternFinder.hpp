@@ -9,13 +9,11 @@
 #pragma once
 
 #include "Acts/Seeding/detail/GlobalPatternFinderAuxiliaries.hpp"
-#include "Acts/Utilities/Helpers.hpp"
 #include "Acts/Utilities/Delegate.hpp"
-#include "Acts/Utilities/KDTree.hpp"
 #include "Acts/Utilities/Logger.hpp"
 
 #include <compare>
-#include <optional>
+#include <span>
 
 /// The Global Pattern Finder (GPF) is a fast reconstruction algorithm whose
 /// primary purpose is to identify and collect detector hits belonging to the
@@ -27,71 +25,67 @@
 ///  The basic assumption of the GPF is that, to first order, the trajectory can
 /// be described by a bending and a non-bending coordinate, where the bending
 /// coordinate describes the direction in which the trajectory changes due to
-/// bending, while the non-bending coordinate remains approximately constant
+/// the magnetic field, while the non-bending coordinate remains approximately constant
 /// over the relevant detector region. As a consequence, the detector can be
 /// sectorized in the non-bending coordinate. This sectorization reduces the
 /// search space and allows the GPF to efficiently identify compatible hits
 /// across the detector layers.
 ///
 ///  The detector is assumed to be organized in layers, which are grouped
-/// into a number of groups. Within a local frame, the layers are ordered by
-/// the layer index of the hits. Hits in different local frames are ordered by
-/// an optional, user-provided fixed ordering of the groups and, where the
-/// ordering is not fixed, by their depth in the detector. This allows the
+/// into a number of groups. The layers are ordered along the trajectory by a
+/// user-provided ordering of the hits (Config::layerOrder). This allows the
 /// pattern-finding algorithm to operate independently of the actual detector
 /// geometry.
 ///
 ///  The precise definition of the bending and non-bending coordinates, as well
-/// as the corresponding sectorization, is detector-dependent. The
-/// pattern-finding strategy itself is independent of these specific coordinate
-/// choices.
+/// as the corresponding sectorization, is detector-dependent. The pattern-finding
+/// strategy itself is independent of these specific coordinate choices.
 ///  **** This first implementation is developed for a toroidal magnetic field
 /// where the bending coordinate is the polar angle theta, while the non-bending
 /// one is the azimuthal angle phi. ****
 ///
-///  The hits are space points of containers, referred to as buckets, satisfying the
-/// @ref CompositeSpacePointContainer concept. All the space points of a
-/// bucket are expressed in the same local frame. The phi-only hits are
-/// searched in the parent buckets of the pattern hits.
+///  The hits are space points satisfying the @ref CompositeSpacePoint concept,
+/// expressed in the global frame: their localPosition(), sensorDirection(),
+/// toNextSensor() and planeNormal() are global. The hit type declares it with
+/// static constexpr bool isGlobalFrame = true and provides its group index and
+/// precision flag. The detector geometry stays with the experiment: the layer 
+/// ordering, the hit overlap and the phi-only hits that can be attached to a 
+/// pattern hit are provided by the user. All the hits are owned by the user and 
+/// must outlive the output patterns.
 ///
-///  The definition of the hit type, of the sectorization concept, together
+///  The definition of the sectorization concept, together
 ///  with the main @ref PatternStateAux object used by the GPF, are provided in the GlobalPatternFinderAuxiliaries.
 namespace Acts::Experimental::detail {
-/// @brief Concept for a pattern seed selector
-template <typename Selector_t, typename Bucket_t, std::uint8_t nGroups>
-concept PatternSeedSelector =
-    requires(const Selector_t& selector, const GlobPatFinderHit<Bucket_t>& hit) {
-      /// Whether the hit is good for seeding a pattern
-      { selector.goodForSeeding(hit) } -> std::same_as<bool>;
-      /// The (half) search window in the theta coordinate for compatible hits
-      /// with a pattern for a given seed hit. The search window is defined per
-      /// group of the pattern topology.
-      {
-        selector.thetaSearchWindow(hit)
-      } -> std::convertible_to<std::array<double, nGroups>>;
-    };
-
-template <CompositeSpacePointContainer Bucket_t, SectorType Sector_t,
+template <CompositeSpacePoint Hit_t, SectorType Sector_t,
           std::uint8_t nGroups>
 class GlobalPatternFinder {
  public:
   /// @brief Pattern state auxiliaries used during the pattern building
-  using PatternStateAux = detail::PatternStateAux<Bucket_t, Sector_t, nGroups>;
+  using PatternStateAux = detail::PatternStateAux<Hit_t, Sector_t, nGroups>;
   /// @brief Beamspot information
   using BeamspotInfo = PatternStateAux::BeamspotInfo;
-  /// @brief Hit type used by the pattern finder
-  using Hit_t = GlobPatFinderHit<Bucket_t>;
-  /// @brief Space point type of the hits
-  using SpacePoint_t = typename Hit_t::SpacePoint_t;
+  /// The hits must be expressed in the global frame: the hit type declares it
+  /// with static constexpr bool isGlobalFrame = true
+  static_assert(requires { requires Hit_t::isGlobalFrame; },
+                "GlobalPatternFinder: the hits must be expressed in the global frame "
+                "(static constexpr bool isGlobalFrame = true in the hit class)");
   /// Whether two hits represent overlapping detector information. This
   /// relation may be less restrictive than requiring equality and is used
   /// when determining whether reconstructed patterns share detector
   /// information.
   using HitOverlap_t = Delegate<bool(const Hit_t&, const Hit_t&)>;
-  /// @brief Delegate to determine the layer index in the local frame of phi-only hits
-  using PhiOnlyLayerIdx_t = Delegate<std::uint8_t(const SpacePoint_t&)>;
-  /// @brief Delegate to fix the ordering of two different groups along the trajectory
-  using GroupOrder_t = Delegate<std::partial_ordering(std::uint8_t, std::uint8_t)>;
+  /// @brief Delegate to order two hits by their measurement layer along the trajectory
+  using LayerOrder_t = Delegate<std::weak_ordering(const Hit_t&, const Hit_t&)>;
+  /// @brief Delegate returning the phi-only hits that can be attached to a pattern hit
+  using PhiOnlyHits_t = Delegate<std::span<const Hit_t>(const Hit_t&)>;
+  /// @brief Delegate returning the group index of a hit in the pattern topology
+  using GroupIndex_t = Delegate<std::uint8_t(const Hit_t&)>;
+  /// @brief Delegate returning whether a hit is a precision measurement
+  using IsPrecision_t = Delegate<bool(const Hit_t&)>;
+  /// @brief Delegate deciding whether a hit seeds a pattern
+  using SeedSelection_t = Delegate<bool(const Hit_t&)>;
+  /// @brief Delegate returning the theta search window, per group, around a seed hit
+  using ThetaSearchWindow_t = Delegate<const std::array<double, nGroups>&(const Hit_t&)>;
   /// @brief Configuration object for the pattern finder
   struct Config : PatternStateAux::Config {
     /// Pattern building acceptance
@@ -127,49 +121,44 @@ class GlobalPatternFinder {
     ///        (0: no limit). The best branches according to isBetterBranch are
     ///        kept.
     unsigned int maxActivePatterns{0};
-    /// @brief Whether to search for phi-only hits in the parent buckets of the pattern hits
-    bool attachPhiOnlyHits{true};
     /// @brief (optional) Delegate to determine whether two hits represent overlapping detector information.
-    ///        If not provided, hits are considered overlapping if they are on the same layer of the
-    ///        same local frame and their measured bending coordinate cannot be distinguished within
-    ///        the measurement uncertainty. The same measurement stored in different local frames is
-    ///        therefore not recognised as overlapping by the default.
+    ///        If not provided, only a hit with itself is considered overlapping.
     HitOverlap_t hitOverlap{};
-    /// @brief Delegate to determine the layer index of phi-only hits in the local frame. It must
-    ///        follow the same numbering as the layer index of the pattern hits (increasing along
-    ///        the local z-axis). Required only if attachPhiOnlyHits is set.
-    PhiOnlyLayerIdx_t phiOnlyLayerIdx{};
-    /// @brief (optional) Fixed ordering of two different groups a and b along the trajectory:
-    ///        less if group a comes before group b, greater if after, and unordered if the
-    ///        order is not fixed by the topology. Must be antisymmetric and transitive. Pairs
-    ///        without a fixed order are ordered by geometry.
-    ///        If not connected, hits in different local frames are ordered by geometry only.
-    GroupOrder_t groupOrder{};
+    /// @brief Delegate ordering two hits by their measurement layer along the trajectory.
+    ///        The hits on the same layer keep the order in which the user provided them.
+    LayerOrder_t layerOrder{};
+    /// @brief (optional) Delegate returning the phi-only hits that can be attached to a pattern hit,
+    ///        i.e. those of the same detector region. Each region is searched only once.
+    PhiOnlyHits_t phiOnlyHits{};
+    /// @brief Delegate returning the group index of a hit in the pattern topology.
+    GroupIndex_t groupIndex{};
+    /// @brief Delegate returning whether a hit is a precision measurement.
+    IsPrecision_t isPrecision{};
+    /// @brief Delegate deciding whether a hit seeds a pattern.
+    SeedSelection_t goodForSeeding{};
+    /// @brief Delegate returning the (half) search window in the theta coordinate, per group of the
+    ///        pattern topology, of the hits compatible with a pattern seeded by a hit.
+    ThetaSearchWindow_t thetaSearchWindow{};
   };
-  /// @brief Abbreviation of the seed coordinates
-  enum class HitCoords : std::uint8_t {
-    /// Sector coordinate of the associated spectrometer sector
-    eSector = 0,
-    /// Global Theta
-    eTheta = 1,
-    /// Number of coordinates
-    eNCoords = 2
+  /// @brief Entry of the hit search: a hit with the sector and the theta coordinate in which it is
+  ///        searched. A hit can have several entries, e.g. in the overlap of two sectors.
+  struct SearchEntry {
+    /// @brief Sector index
+    typename Sector_t::Index_t sector{};
+    /// @brief Theta coordinate [rad]
+    double theta{0.};
+    /// @brief The hit, owned by the user
+    const Hit_t* hit{nullptr};
   };
-
-  /// @brief Definition of the search tree class
-  using SearchTree_t = KDTree<toUnderlying(HitCoords::eNCoords), const Hit_t*,
-                              double, std::array, 50>;
+  /// @brief Entries of the hit search
+  using SearchEntries_t = std::vector<SearchEntry>;
 
   /// @brief Structure to hold the pattern result
   struct OutputPattern {
     explicit OutputPattern(typename Sector_t::Index_t sectorIdx)
         : sector{sectorIdx} {}
-    /// @brief Vector of hits in the pattern
+    /// @brief Hits of the pattern per group, owned by the user, including phi-only hits
     std::array<std::vector<const Hit_t*>, nGroups> hitsPerGroup{};
-    /// @brief Vector of phi-only hits
-    std::vector<Hit_t> phiOnlyHits{};
-    /// @brief Distinct parent buckets of the pattern hits
-    std::vector<const Bucket_t*> parentBuckets{};
     /// @brief Mean over eta hits of the square of their residual divided by residual uncertainty
     double meanNormResidual2{0.};
     /// @brief Pattern phi, which is the phi of the bending plane where the pattern lies
@@ -196,18 +185,17 @@ class GlobalPatternFinder {
                                    getDefaultLogger("GlobalPatternFinder",
                                                     Logging::Level::INFO));
 
-  /// @brief Main method steering the pattern finding. Given the search tree of
-  ///         hits, it builds patterns in eta, attaches the compatible phi-only
-  ///         hits if Config::attachPhiOnlyHits is set, and converts the
-  ///         patterns into OutputPatterns.
-  ///  @param treeData: Data for the search tree
-  ///  @param seedSelector: Selector for the seed
+  /// @brief Main method steering the pattern finding. Given the search entries
+  ///         of the hits, it builds patterns in eta, attaches the compatible
+  ///         phi-only hits if Config::phiOnlyHits is connected, and converts the
+  ///         patterns into OutputPatterns. The entries are sorted by sector and
+  ///         theta (stable: equal entries keep their order); the seeds are tried
+  ///         in this order and the candidate hits of a seed come in theta order.
+  ///  @param searchEntries: Search entries of the hits (any order)
   ///  @param beamspotInfo: Beamspot information
   ///  @return: Vector of found patterns
-  template <PatternSeedSelector<Bucket_t, nGroups> SeedSelector_t>
   std::vector<OutputPattern> findPatterns(
-      const SearchTree_t& treeData,
-      const SeedSelector_t& seedSelector,
+      SearchEntries_t searchEntries,
       const BeamspotInfo& beamspotInfo) const;
 
  private:
@@ -229,13 +217,10 @@ class GlobalPatternFinder {
   using LineTestResult_t = std::pair<LineTestDecision, LineTestRes>;
 
   /// @brief Method steering the global pattern building in the bending plane.
-  ///  @param orderedSpacepoints: Search tree with spacepoints ordered by their corresponding coordinates
-  ///  @param seedSelector: The seed selector to use for selecting the initial seed
+  ///  @param searchEntries: Search entries of the hits, sorted by sector and theta
   ///  @param beamspotInfo: Information about the beam spot
   ///  @return: resulting vector of PatternStateAuxs successfully built
-  template <PatternSeedSelector<Bucket_t, nGroups> SeedSelector_t>
-  PatternStateAuxVec findPatternsInEta(const SearchTree_t& orderedSpacepoints,
-                                       const SeedSelector_t& seedSelector,
+  PatternStateAuxVec findPatternsInEta(const SearchEntries_t& searchEntries,
                                        const BeamspotInfo& beamspotInfo) const;
   /// @brief Main function controlling the development of patterns, including pattern branching when necessary.
   ///         It tests pattern compatibility of a set of active patterns
@@ -296,14 +281,7 @@ class GlobalPatternFinder {
   ///  @return: true if pattern a is ranked before pattern b
   static bool isBetterBranch(const PatternStateAux& a,
                              const PatternStateAux& b);
-  /// @brief Method to sort the hits in a pattern by their measurement layer
-  ///  @param a: first hit
-  ///  @param b: second hit
-  ///  @return: weak ordering of the two hits by their measurement layer
-  std::weak_ordering compareLayers(const Hit_t& a, 
-                                   const Hit_t& b) const;
-  /// @brief Default hit overlap: same space point, or same layer of the same local frame
-  ///        with bending coordinates compatible within the measurement uncertainty
+  /// @brief Default hit overlap: only a hit with itself
   ///  @param a: first hit
   ///  @param b: second hit
   ///  @return: true if the hits are overlapping, false otherwise
@@ -324,10 +302,10 @@ class GlobalPatternFinder {
   /// @brief Count the number of patterns that contain a specific hit
   ///  @param patterns: Vector of pattern states to check
   ///  @param seed: The seed hit to check
-  ///  @param seedCoords: The coordinates of the seed hit
+  ///  @param seedEntry: The search entry of the seed hit
   ///  @return: The number of patterns that contain the hit
   unsigned countPatterns(const PatternStateAuxVec& patterns, const Hit_t& seed,
-                         const SearchTree_t::coordinate_t& seedCoords) const;
+                         const SearchEntry& seedEntry) const;
   /// @brief Convert a PatternStateAux into an OutputPattern object
   ///  @param candidate: PatternStateAux to be converted
   ///  @return: Converted OutputPattern
@@ -340,11 +318,6 @@ class GlobalPatternFinder {
 
   /// @brief Global Pattern Recognition configuration
   Config m_cfg;
-  /// @brief Type alias for the table caching the ordering of the groups along the trajectory
-  using GroupOrderTable_t = std::array<std::array<std::optional<bool>, nGroups>, nGroups>;
-  /// @brief Cached Config::groupOrder: m_groupOrder[a][b] is true if group a comes before
-  ///        group b, false if after, and empty if the order is not fixed
-  GroupOrderTable_t m_groupOrder{};
   /// @brief Cut to the residual when we have 2 dof
   double m_cut2Dof{std::sqrt(
       -2. * std::log(std::erfc(m_cfg.nResidualSigma / std::numbers::sqrt2)))};
